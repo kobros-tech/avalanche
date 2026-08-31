@@ -162,7 +162,7 @@ def run_condition(use_skill_memory: bool, seed: int) -> Dict:
         make_experience(0, "multiply", (), seed),
         make_experience(1, "add", (), seed),
         make_experience(2, "square", ("multiply",), seed),
-        make_experience(3, "divide", ("division",), seed),
+        make_experience(3, "divide", (), seed),
     ]
 
     mse_history: List[Dict[str, float]] = []
@@ -225,29 +225,67 @@ def std(values: List[float]) -> float:
     return math.sqrt(sum((value - average) ** 2 for value in values) / (len(values) - 1))
 
 
+def ci95(values: List[float]) -> List[float]:
+    average = mean(values)
+    half_width = 1.96 * std(values) / math.sqrt(len(values))
+    return [average - half_width, average + half_width]
+
+
 def summarize(runs: List[Dict]) -> Dict:
     summary = {}
     for task in TASKS:
         values = [run["final_mse"][task] for run in runs]
-        task_std = std(values)
-        half_width = 1.96 * task_std / math.sqrt(len(values))
         summary[task] = {
             "mean": mean(values),
-            "std": task_std,
-            "ci95": [mean(values) - half_width, mean(values) + half_width],
+            "std": std(values),
+            "ci95": ci95(values),
         }
 
+    summary["forgetting_mse"] = {}
     for task in TASKS[:-1]:
         values = [run["forgetting_mse"][task] for run in runs]
-        task_std = std(values)
-        half_width = 1.96 * task_std / math.sqrt(len(values))
-        summary.setdefault("forgetting_mse", {})[task] = {
+        summary["forgetting_mse"][task] = {
             "mean": mean(values),
-            "std": task_std,
-            "ci95": [mean(values) - half_width, mean(values) + half_width],
+            "std": std(values),
+            "ci95": ci95(values),
         }
 
     return summary
+
+
+def paired_metric_summary(
+    baseline_runs: List[Dict], skill_memory_runs: List[Dict], metric: str
+) -> Dict:
+    """Summarize paired Skill Memory minus baseline differences by task.
+
+    The same seed is compared across both conditions, so this is a paired
+    comparison rather than an independent-samples comparison.
+    """
+    result = {}
+    for task in TASKS:
+        if metric == "final_mse":
+            baseline_values = [run["final_mse"][task] for run in baseline_runs]
+            skill_values = [run["final_mse"][task] for run in skill_memory_runs]
+        elif metric == "forgetting_mse":
+            baseline_values = [run["forgetting_mse"][task] for run in baseline_runs]
+            skill_values = [run["forgetting_mse"][task] for run in skill_memory_runs]
+        else:
+            raise ValueError(f"unknown metric: {metric}")
+
+        differences = [skill - baseline for skill, baseline in zip(skill_values, baseline_values)]
+        wins = sum(difference < 0.0 for difference in differences)
+        losses = sum(difference > 0.0 for difference in differences)
+        ties = len(differences) - wins - losses
+        result[task] = {
+            "skill_memory_minus_baseline_mean": mean(differences),
+            "skill_memory_minus_baseline_std": std(differences),
+            "ci95": ci95(differences),
+            "skill_memory_wins": wins,
+            "baseline_wins": losses,
+            "ties": ties,
+            "n": len(differences),
+        }
+    return result
 
 
 def main() -> None:
@@ -262,9 +300,15 @@ def main() -> None:
     skill_memory_runs = [item["skill_memory"] for item in results]
 
     result = {
-        "benchmark": "skill_memory_arithmetic_multiseed_v1",
+        "benchmark": "skill_memory_arithmetic_multiseed_v2",
         "description": "15-seed controlled baseline vs Skill Memory continual-learning benchmark.",
         "seeds": SEEDS,
+        "metric_definitions": {
+            "final_mse": "MSE on an independent evaluation set after the final experience.",
+            "forgetting_mse": "max(0, final MSE - minimum MSE observed after any experience for that task).",
+            "paired_difference": "Skill Memory metric minus baseline metric for the same seed.",
+            "confidence_interval": "Approximate 95% CI using mean +/- 1.96 * sample SD / sqrt(n).",
+        },
         "conditions": {
             "baseline": {
                 "runs": baseline_runs,
@@ -275,6 +319,10 @@ def main() -> None:
                 "summary": summarize(skill_memory_runs),
             },
         },
+        "paired_comparison": {
+            "final_mse": paired_metric_summary(baseline_runs, skill_memory_runs, "final_mse"),
+            "forgetting_mse": paired_metric_summary(baseline_runs, skill_memory_runs, "forgetting_mse"),
+        },
     }
 
     output_path = Path("results/skill_memory_benchmark_multiseed.json")
@@ -284,6 +332,11 @@ def main() -> None:
     for condition_name in ("baseline", "skill_memory"):
         print(f"\n[{condition_name}]")
         print(json.dumps(result["conditions"][condition_name]["summary"], indent=2))
+
+    print("\n[paired final MSE]")
+    print(json.dumps(result["paired_comparison"]["final_mse"], indent=2))
+    print("\n[paired forgetting MSE]")
+    print(json.dumps(result["paired_comparison"]["forgetting_mse"], indent=2))
 
     for run in skill_memory_runs:
         decisions = [item["decision"] for item in run["decisions"]]
