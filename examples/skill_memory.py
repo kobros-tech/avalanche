@@ -5,7 +5,6 @@ intentional: different continual-learning settings can provide different task
 descriptors and compatibility estimators without changing the registry.
 """
 
-import torch
 from torch import nn
 from torch.optim import SGD
 
@@ -13,18 +12,17 @@ from avalanche.training import Naive
 from avalanche.training.skill_memory import SkillMemory, SkillMemoryPlugin
 
 
-class TaskDescriptor:
-    def __init__(self, task_id: int):
-        self.task_id = task_id
-
-
 def compatibility(record, experience):
-    """Example compatibility function for task IDs.
+    """Example compatibility function based on stored task metadata.
 
     Real applications should use an independently defined task/skill
     compatibility estimator rather than inspecting target test labels.
     """
-    return 1.0 if record.metadata.get("task_id") == experience.current_experience else 0.0
+    return (
+        1.0
+        if record.metadata.get("task_id") == experience.current_experience
+        else 0.0
+    )
 
 
 model = nn.Sequential(nn.Linear(10, 20), nn.ReLU(), nn.Linear(20, 2))
@@ -34,6 +32,7 @@ memory = SkillMemory(max_skills=10)
 plugin = SkillMemoryPlugin(
     memory=memory,
     skill_name=lambda exp: f"task-{exp.current_experience}",
+    skill_metadata=lambda exp: {"task_id": exp.current_experience},
     compatibility=compatibility,
     threshold=0.8,
 )
