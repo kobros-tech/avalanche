@@ -3,13 +3,10 @@
 The benchmark compares otherwise identical continual-learning runs:
 
 * ``baseline``: ordinary Naive training across four arithmetic tasks.
-* ``skill_memory``: the same training with SkillMemoryPlugin enabled.
+* ``skill_memory``: the same training with automatic score-driven Skill Memory.
 
-This benchmark is intended to quantify whether the observed single-seed result
-is robust across fixed seeds. It reports per-seed metrics plus aggregate mean,
-standard deviation, and a 95% confidence interval for final MSE and forgetting.
-The compatibility function uses only training-experience descriptors; evaluation
-samples are generated independently and never passed to the reuse decision.
+The evaluation set is generated independently and is never passed to the
+compatibility decision.
 """
 
 from __future__ import annotations
@@ -96,17 +93,27 @@ def make_experience(index: int, operation: str, prerequisites: Tuple[str, ...], 
         current_experience=index,
         operation=operation,
         prerequisites=prerequisites,
-        dataset=make_dataset(operation, TRAIN_SAMPLES, TRAIN_SEED_BASE + seed * len(TASKS) + index),
+        dataset=make_dataset(
+            operation,
+            TRAIN_SAMPLES,
+            TRAIN_SEED_BASE + seed * len(TASKS) + index,
+        ),
         origin_stream=ArithmeticStream(name="arithmetic_train"),
     )
 
 
 def compatibility(record, experience: ArithmeticExperience) -> float:
+    # This score uses only training-experience metadata. A direct prerequisite
+    # is deliberately treated as a high-compatibility transfer candidate.
     return float(record.metadata.get("operation") in experience.prerequisites)
 
 
 def evaluate(model: nn.Module, operation: str, seed: int) -> float:
-    dataset = make_dataset(operation, EVAL_SAMPLES, EVAL_SEED_BASE + seed * len(TASKS) + TASKS.index(operation))
+    dataset = make_dataset(
+        operation,
+        EVAL_SAMPLES,
+        EVAL_SEED_BASE + seed * len(TASKS) + TASKS.index(operation),
+    )
     model.eval()
     with torch.no_grad():
         predictions = model(dataset.tensors[0])
@@ -138,7 +145,8 @@ def build_strategy(use_skill_memory: bool):
             skill_name=lambda exp: exp.operation,
             skill_metadata=metadata,
             compatibility=compatibility,
-            threshold=0.5,
+            reuse_threshold=0.90,
+            clone_threshold=0.30,
         )
         plugins.append(skill_plugin)
 
@@ -175,18 +183,19 @@ def run_condition(use_skill_memory: bool, seed: int) -> Dict:
         if plugin is None:
             decision = "baseline"
             score = None
-        elif plugin.last_reused_skill is None:
-            decision = "acquire"
-            score = plugin.last_compatibility_score
         else:
-            decision = f"reuse:{plugin.last_reused_skill}"
+            decision = plugin.last_decision
+            if plugin.last_selected_skill is not None:
+                decision = f"{decision}:{plugin.last_selected_skill}"
             score = plugin.last_compatibility_score
 
-        decisions.append({
-            "operation": experience.operation,
-            "decision": decision,
-            "compatibility_score": score,
-        })
+        decisions.append(
+            {
+                "operation": experience.operation,
+                "decision": decision,
+                "compatibility_score": score,
+            }
+        )
 
         current = {
             operation: evaluate(strategy.model, operation, seed)
@@ -298,25 +307,23 @@ def main() -> None:
     skill_memory_runs = [item["skill_memory"] for item in results]
 
     result = {
-        "benchmark": "skill_memory_arithmetic_multiseed_v2",
-        "description": "15-seed controlled baseline vs Skill Memory continual-learning benchmark.",
+        "benchmark": "skill_memory_arithmetic_multiseed_v3",
+        "description": "15-seed controlled baseline vs automatic score-driven Skill Memory benchmark.",
+        "policy": {
+            "reuse_threshold": 0.90,
+            "clone_threshold": 0.30,
+        },
         "seeds": SEEDS,
         "metric_definitions": {
             "final_mse": "MSE on an independent evaluation set after the final experience.",
             "forgetting_mse": "max(0, final MSE - minimum MSE observed after any experience for that task).",
             "paired_difference": "Skill Memory metric minus baseline metric for the same seed.",
             "confidence_interval": "Approximate 95% CI using mean +/- 1.96 * sample SD / sqrt(n).",
-            "forgetting_scope": "Only previously encountered tasks (multiply, add, square); divide is excluded because there is no later experience after it to measure forgetting.",
+            "forgetting_scope": "Only previously encountered tasks; divide is excluded because there is no later experience after it to measure forgetting.",
         },
         "conditions": {
-            "baseline": {
-                "runs": baseline_runs,
-                "summary": summarize(baseline_runs),
-            },
-            "skill_memory": {
-                "runs": skill_memory_runs,
-                "summary": summarize(skill_memory_runs),
-            },
+            "baseline": {"runs": baseline_runs, "summary": summarize(baseline_runs)},
+            "skill_memory": {"runs": skill_memory_runs, "summary": summarize(skill_memory_runs)},
         },
         "paired_comparison": {
             "final_mse": paired_metric_summary(baseline_runs, skill_memory_runs, "final_mse"),
@@ -339,7 +346,7 @@ def main() -> None:
 
     for run in skill_memory_runs:
         decisions = [item["decision"] for item in run["decisions"]]
-        assert decisions == ["acquire", "acquire", "reuse:multiply", "acquire"]
+        assert decisions == ["scratch", "scratch", "reuse:multiply", "scratch"]
         assert run["stored_skills"] == TASKS
 
     print(f"\nResults written to {output_path}")
