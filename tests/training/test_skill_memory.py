@@ -261,11 +261,12 @@ def test_plugin_runs_across_sequential_experiences():
     strategy.train(benchmark.train_stream[0])
     assert plugin.last_reused_skill is None
     assert memory.contains("experience-0")
+    assert seen == []
 
     strategy.train(benchmark.train_stream[1])
     assert plugin.last_reused_skill == "experience-0"
     assert memory.contains("experience-1")
-    assert seen == [0, 1]
+    assert seen == [1]
 
 
 def test_plugin_does_not_query_memory_during_eval():
@@ -276,6 +277,8 @@ def test_plugin_does_not_query_memory_during_eval():
     optimizer = torch.optim.SGD(model.parameters(), lr=1e-3)
     criterion = nn.CrossEntropyLoss()
     memory = SkillMemory()
+    source = SimpleMLP(input_size=6, hidden_size=10)
+    memory.register("seed-skill", source.state_dict())
     calls = []
 
     def compatibility(record, exp):
@@ -295,9 +298,10 @@ def test_plugin_does_not_query_memory_during_eval():
 
     strategy.train(benchmark.train_stream[0])
     train_call_count = len(calls)
+    assert train_call_count > 0
+
     strategy.eval(benchmark.test_stream[0])
 
-    assert train_call_count > 0
     assert len(calls) == train_call_count
 
 
