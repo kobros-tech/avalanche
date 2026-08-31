@@ -150,6 +150,52 @@ class SkillMemory:
             return None, best_score if best_record is not None else 0.0
         return best_record, best_score
 
+    def state_dict(self) -> dict[str, Any]:
+        """Return a checkpointable copy of the complete memory state."""
+
+        return {
+            "max_skills": self.max_skills,
+            "order": self._order,
+            "records": {
+                name: {
+                    "state_dict": _copy_state_dict_to_cpu(record.state_dict),
+                    "metadata": deepcopy(record.metadata),
+                    "creation_order": record.creation_order,
+                }
+                for name, record in self._records.items()
+            },
+        }
+
+    def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        """Restore memory state produced by :meth:`state_dict`."""
+
+        records = state.get("records")
+        if not isinstance(records, Mapping):
+            raise ValueError("invalid skill-memory state: missing records")
+
+        max_skills = state.get("max_skills", self.max_skills)
+        if max_skills is not None and max_skills < 1:
+            raise ValueError("max_skills must be positive or None")
+        if max_skills is not None and len(records) > max_skills:
+            raise ValueError("checkpoint contains more skills than max_skills")
+
+        restored: dict[str, SkillRecord] = {}
+        for name, value in records.items():
+            if not isinstance(value, Mapping) or "state_dict" not in value:
+                raise ValueError(f"invalid skill record for '{name}'")
+            restored[str(name)] = SkillRecord(
+                name=str(name),
+                state_dict=_copy_state_dict_to_cpu(value["state_dict"]),
+                metadata=deepcopy(dict(value.get("metadata", {}))),
+                creation_order=int(value.get("creation_order", 0)),
+            )
+
+        self.max_skills = max_skills
+        self._records = restored
+        self._order = int(state.get("order", max(
+            (record.creation_order for record in restored.values()), default=0
+        )))
+
     def load_into(self, name: str, model: torch.nn.Module) -> SkillRecord:
         """Load a stored skill into ``model`` and return its record."""
 
