@@ -34,7 +34,7 @@ jobs:
           USE_GPU: "False"
           PYTHONPATH: ${{ github.workspace }}
         run: |
-          pytest tests/training/test_skill_memory.py -v \
+          pytest -n 0 tests/training/test_skill_memory.py -v \
             -k "not test_plugin_runs_inside_real_avalanche_training_loop"
       - name: Run Skill Memory Avalanche integration test
         env:
@@ -42,7 +42,7 @@ jobs:
           USE_GPU: "False"
           PYTHONPATH: ${{ github.workspace }}
         run: |
-          pytest tests/training/test_skill_memory.py -v \
+          pytest -n 0 tests/training/test_skill_memory.py -v \
             -k "test_plugin_runs_inside_real_avalanche_training_loop"
       - name: Run Skill Memory example
         env:
