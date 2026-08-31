@@ -1,78 +1,52 @@
 # Skill Memory benchmark
 
-This benchmark is a controlled proof-of-benefit experiment for the Skill Memory integration.
-It is intentionally small and should not be presented as a general continual-learning result.
+This document describes two development benchmarks for the Skill Memory integration. The arithmetic benchmark is a controlled proof-of-benefit experiment; the RotatedMNIST benchmark is the first standard Avalanche scenario used to test whether the behavior extends beyond arithmetic.
 
-## Conditions
+## Controlled arithmetic benchmark
 
-Two otherwise identical Avalanche `Naive` runs are compared:
+The arithmetic benchmark compares two otherwise identical Avalanche `Naive` runs:
 
 - **baseline**: normal sequential training with no Skill Memory plugin;
 - **skill_memory**: the same model, optimizer, data, seeds, batch size, and epoch budget,
   with `SkillMemoryPlugin` enabled.
 
-The model and optimizer are initialized from the same random seed for each condition.
+The arithmetic compatibility function is deliberately explicit and is not intended to be a learned task-similarity model. Evaluation data are independent from training data and are never passed to the compatibility function.
 
-## Task sequence
+For the 15-seed benchmark, the output includes final MSE, MSE history, forgetting, decisions, stored skills, aggregate mean/std/95% CI, and paired per-seed differences between Skill Memory and baseline.
 
-| Experience | Operation | Expected Skill Memory decision |
-| --- | --- | --- |
-| 0 | multiplication | acquire |
-| 1 | addition | acquire |
-| 2 | square | reuse `multiply` |
-| 3 | division | no compatible prerequisite, then acquire |
+Forgetting is defined as `max(0, final MSE - minimum MSE observed after any experience for that task)`. The final task is excluded from forgetting because there is no later experience after which forgetting can be measured.
 
-The compatibility function is deliberately explicit: it matches a stored operation only
-when that operation appears in the current training experience's prerequisite list.
-Square declares `multiply` as its prerequisite. Division declares no prerequisites, so it
-cannot reuse an existing skill in this controlled benchmark. This isolates the memory/reuse
-mechanism; it does **not** claim that the compatibility function is a learned task-similarity model.
+The arithmetic output is written to `results/skill_memory_benchmark_multiseed.json`.
 
-## Evaluation protocol
+## Standard Avalanche benchmark: RotatedMNIST
 
-Training and evaluation datasets use different deterministic seeds. Evaluation data are
-created only after training and are never passed to the compatibility function.
-Therefore the reuse decision cannot inspect evaluation targets.
+The next-stage benchmark uses Avalanche's standard `RotatedMNIST` scenario rather than the synthetic arithmetic stream. The transformation sequence is:
 
-For every experience, the benchmark evaluates all tasks seen so far. The recorded metrics are:
+| Experience | Rotation | Expected Skill Memory decision |
+| --- | ---: | --- |
+| 0 | 0° | acquire |
+| 1 | 30° | acquire |
+| 2 | 60° | acquire |
+| 3 | 0° | reuse the earlier 0° skill |
+| 4 | 30° | reuse the earlier 30° skill |
 
-- final MSE for each task;
-- MSE history after each experience;
-- per-task forgetting, measured as `max(0, final MSE - minimum MSE observed after any experience for that task)`;
-- Skill Memory decision and compatibility score for every experience;
-- stored skill names.
+Repeated transformations provide legitimate reuse opportunities without hard-coding source/target task pairs. Compatibility is based only on the known training-task rotation metadata; test samples and targets are not used for the reuse decision.
 
-The 15-seed benchmark additionally reports mean, sample standard deviation, and an approximate
-95% confidence interval for each condition. It also reports paired differences (`Skill Memory - baseline`)
-for each seed, along with the number of seeds won by each condition. Pairing by seed is important because
-the same seed defines the corresponding baseline and Skill Memory run.
+Three conditions are compared:
 
-## Multi-seed benchmark
+- **naive**: standard Avalanche `Naive` training;
+- **replay**: `Naive` plus Avalanche `ReplayPlugin` with a fixed replay memory;
+- **skill_memory**: `Naive` plus `SkillMemoryPlugin`.
 
-The development benchmark uses fixed seeds `0..14`. It should be interpreted as a robustness check
-for the controlled arithmetic result, not as evidence of general continual-learning superiority.
+The standard benchmark uses three fixed seeds for the initial Step 2 validation. It records per-experience test accuracy, final accuracy, forgetting on previously seen experiences, Skill Memory acquisition/reuse decisions, stored skills, and training time.
 
-The most important comparison is the paired forgetting difference. Negative values mean Skill Memory
-has less forgetting than baseline. Final MSE is reported separately because lower forgetting does not
-necessarily imply lower final task error.
+This benchmark is deliberately modest: it establishes whether the prototype can operate in a standard Avalanche continual-learning scenario and provides a comparison against replay. It is not yet the final upstream-quality benchmark. If the implementation is stable and the effect is meaningful, the next iteration should expand the seed count and add more standard scenarios before making broad claims.
 
-The benchmark output is written to `results/skill_memory_benchmark_multiseed.json`.
+The standard benchmark output is written to `results/skill_memory_rotated_mnist.json`.
 
 ## Interpretation
 
-A successful run proves that the integration works and records the observed result; it does **not**
-by itself establish a statistically significant research claim.
-
-The arithmetic experiment is designed to answer two separate questions:
-
-1. Does Skill Memory reliably make the intended reuse decision across seeds?
-2. Does that reuse mechanism change continual-learning behavior, especially forgetting?
-
-A positive forgetting result should not be described as a general improvement until it is reproduced
-on a standard Avalanche continual-learning benchmark with an appropriate baseline.
-
-The next step after this controlled multi-seed analysis is a broader benchmark in a standard Avalanche
-scenario.
+The arithmetic experiment is the controlled mechanistic test. The RotatedMNIST experiment is the first generalization test. A positive result on either benchmark should be interpreted in context; neither benchmark alone establishes general continual-learning superiority.
 
 ## Running
 
@@ -80,7 +54,5 @@ From the repository root:
 
 ```bash
 python examples/skill_memory_benchmark.py
+python examples/skill_memory_standard_benchmark.py
 ```
-
-The script is deterministic with respect to the configured seeds and writes a machine-readable JSON
-result suitable for paired analysis across the baseline and Skill Memory conditions.
