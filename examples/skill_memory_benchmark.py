@@ -1,24 +1,21 @@
-"""Controlled benchmark for the Skill Memory Avalanche integration.
+"""Controlled multi-seed benchmark for the Skill Memory Avalanche integration.
 
-The benchmark compares two otherwise identical continual-learning runs:
+The benchmark compares otherwise identical continual-learning runs:
 
-* ``baseline``: ordinary Naive training across the four arithmetic tasks.
+* ``baseline``: ordinary Naive training across four arithmetic tasks.
 * ``skill_memory``: the same training with SkillMemoryPlugin enabled.
 
-The task sequence is deliberately small and controlled. Multiplication and
-addition are acquired first; squaring declares multiplication as a prerequisite
-and can therefore reuse it; division declares an incompatible prerequisite and
-must be acquired normally.
-
-Evaluation data are generated independently from training data and are never
-passed to the compatibility function. The benchmark is intended to provide
-compact evidence for whether the integration is worth further investigation,
-not to establish a general research claim.
+This benchmark is intended to quantify whether the observed single-seed result
+is robust across fixed seeds. It reports per-seed metrics plus aggregate mean,
+standard deviation, and a 95% confidence interval for final MSE and forgetting.
+The compatibility function uses only training-experience descriptors; evaluation
+samples are generated independently and never passed to the reuse decision.
 """
 
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -31,24 +28,21 @@ from avalanche.training import Naive
 from avalanche.training.skill_memory import SkillMemory, SkillMemoryPlugin
 
 
-SEED = 7
+SEEDS = list(range(15))
 TRAIN_SAMPLES = 64
 EVAL_SAMPLES = 64
 TRAIN_SEED_BASE = 100
 EVAL_SEED_BASE = 10_000
 EPOCHS = 3
+TASKS = ["multiply", "add", "square", "divide"]
 
 
 @dataclass
 class ArithmeticStream:
-    """Minimal stream descriptor required by Avalanche's training template."""
-
     name: str
 
 
 class ArithmeticDataset(Dataset):
-    """Small dataset adapter implementing Avalanche's train/eval protocol."""
-
     def __init__(self, tensors: Tuple[torch.Tensor, torch.Tensor]):
         self.tensors = tensors
 
@@ -67,8 +61,6 @@ class ArithmeticDataset(Dataset):
 
 @dataclass
 class ArithmeticExperience:
-    """Minimal Avalanche-compatible supervised experience for the benchmark."""
-
     current_experience: int
     operation: str
     prerequisites: Tuple[str, ...]
@@ -76,12 +68,10 @@ class ArithmeticExperience:
     origin_stream: ArithmeticStream
 
     def logging(self):
-        """Return the representation expected by EvaluationPlugin."""
         return self
 
 
 def make_dataset(operation: str, n_samples: int, seed: int) -> ArithmeticDataset:
-    """Generate deterministic data for one arithmetic operation."""
     generator = torch.Generator().manual_seed(seed)
     x = torch.rand(n_samples, 2, generator=generator) * 4.0 + 1.0
     a, b = x[:, 0], x[:, 1]
@@ -100,27 +90,22 @@ def make_dataset(operation: str, n_samples: int, seed: int) -> ArithmeticDataset
     return ArithmeticDataset((x, y.unsqueeze(1)))
 
 
-def make_experience(
-    index: int, operation: str, prerequisites: Tuple[str, ...]
-) -> ArithmeticExperience:
-    """Create one training experience."""
+def make_experience(index: int, operation: str, prerequisites: Tuple[str, ...], seed: int):
     return ArithmeticExperience(
         current_experience=index,
         operation=operation,
         prerequisites=prerequisites,
-        dataset=make_dataset(operation, TRAIN_SAMPLES, TRAIN_SEED_BASE + index),
+        dataset=make_dataset(operation, TRAIN_SAMPLES, TRAIN_SEED_BASE + seed * len(TASKS) + index),
         origin_stream=ArithmeticStream(name="arithmetic_train"),
     )
 
 
 def compatibility(record, experience: ArithmeticExperience) -> float:
-    """Return compatibility from training-task descriptors only."""
     return float(record.metadata.get("operation") in experience.prerequisites)
 
 
-def evaluate(model: nn.Module, operation: str, experience_index: int) -> float:
-    """Evaluate on an independent, deterministic dataset."""
-    dataset = make_dataset(operation, EVAL_SAMPLES, EVAL_SEED_BASE + experience_index)
+def evaluate(model: nn.Module, operation: str, seed: int) -> float:
+    dataset = make_dataset(operation, EVAL_SAMPLES, EVAL_SEED_BASE + seed * len(TASKS) + TASKS.index(operation))
     model.eval()
     with torch.no_grad():
         predictions = model(dataset.tensors[0])
@@ -128,7 +113,6 @@ def evaluate(model: nn.Module, operation: str, experience_index: int) -> float:
 
 
 def build_strategy(use_skill_memory: bool):
-    """Build identical training strategies, optionally adding Skill Memory."""
     model = nn.Sequential(
         nn.Linear(2, 16),
         nn.ReLU(),
@@ -170,16 +154,15 @@ def build_strategy(use_skill_memory: bool):
     return strategy, memory, skill_plugin
 
 
-def run_condition(use_skill_memory: bool) -> Dict:
-    """Run one benchmark condition from an identical initialization."""
-    torch.manual_seed(SEED)
+def run_condition(use_skill_memory: bool, seed: int) -> Dict:
+    torch.manual_seed(seed)
     strategy, memory, plugin = build_strategy(use_skill_memory)
 
     experiences = [
-        make_experience(0, "multiply", ()),
-        make_experience(1, "add", ()),
-        make_experience(2, "square", ("multiply",)),
-        make_experience(3, "divide", ("division",)),
+        make_experience(0, "multiply", (), seed),
+        make_experience(1, "add", (), seed),
+        make_experience(2, "square", ("multiply",), seed),
+        make_experience(3, "divide", ("division",), seed),
     ]
 
     mse_history: List[Dict[str, float]] = []
@@ -198,32 +181,28 @@ def run_condition(use_skill_memory: bool) -> Dict:
             decision = f"reuse:{plugin.last_reused_skill}"
             score = plugin.last_compatibility_score
 
-        decisions.append(
-            {
-                "operation": experience.operation,
-                "decision": decision,
-                "compatibility_score": score,
-            }
-        )
+        decisions.append({
+            "operation": experience.operation,
+            "decision": decision,
+            "compatibility_score": score,
+        })
 
         current = {
-            operation: evaluate(strategy.model, operation, index)
-            for index, operation in enumerate(
-                ["multiply", "add", "square", "divide"]
-            )
+            operation: evaluate(strategy.model, operation, seed)
+            for index, operation in enumerate(TASKS)
             if index <= experience.current_experience
         }
         mse_history.append(current)
 
     final_mse = mse_history[-1]
     forgetting = {}
-    for operation in ("multiply", "add", "square"):
+    for operation in TASKS[:-1]:
         values = [row[operation] for row in mse_history if operation in row]
         forgetting[operation] = max(0.0, values[-1] - min(values))
 
     return {
         "condition": "skill_memory" if use_skill_memory else "baseline",
-        "seed": SEED,
+        "seed": seed,
         "epochs_per_experience": EPOCHS,
         "train_samples_per_experience": TRAIN_SAMPLES,
         "eval_samples_per_task": EVAL_SAMPLES,
@@ -235,39 +214,81 @@ def run_condition(use_skill_memory: bool) -> Dict:
     }
 
 
+def mean(values: List[float]) -> float:
+    return sum(values) / len(values)
+
+
+def std(values: List[float]) -> float:
+    if len(values) < 2:
+        return 0.0
+    average = mean(values)
+    return math.sqrt(sum((value - average) ** 2 for value in values) / (len(values) - 1))
+
+
+def summarize(runs: List[Dict]) -> Dict:
+    summary = {}
+    for task in TASKS:
+        values = [run["final_mse"][task] for run in runs]
+        task_std = std(values)
+        half_width = 1.96 * task_std / math.sqrt(len(values))
+        summary[task] = {
+            "mean": mean(values),
+            "std": task_std,
+            "ci95": [mean(values) - half_width, mean(values) + half_width],
+        }
+
+    for task in TASKS[:-1]:
+        values = [run["forgetting_mse"][task] for run in runs]
+        task_std = std(values)
+        half_width = 1.96 * task_std / math.sqrt(len(values))
+        summary.setdefault("forgetting_mse", {})[task] = {
+            "mean": mean(values),
+            "std": task_std,
+            "ci95": [mean(values) - half_width, mean(values) + half_width],
+        }
+
+    return summary
+
+
 def main() -> None:
-    """Run both conditions and write machine-readable results."""
-    baseline = run_condition(False)
-    skill_memory = run_condition(True)
+    results = []
+    for seed in SEEDS:
+        print(f"Running seed {seed}...")
+        baseline = run_condition(False, seed)
+        skill_memory = run_condition(True, seed)
+        results.append({"seed": seed, "baseline": baseline, "skill_memory": skill_memory})
+
+    baseline_runs = [item["baseline"] for item in results]
+    skill_memory_runs = [item["skill_memory"] for item in results]
 
     result = {
-        "benchmark": "skill_memory_arithmetic_v1",
-        "description": "Controlled baseline vs Skill Memory continual-learning run.",
-        "seed": SEED,
-        "conditions": [baseline, skill_memory],
+        "benchmark": "skill_memory_arithmetic_multiseed_v1",
+        "description": "15-seed controlled baseline vs Skill Memory continual-learning benchmark.",
+        "seeds": SEEDS,
+        "conditions": {
+            "baseline": {
+                "runs": baseline_runs,
+                "summary": summarize(baseline_runs),
+            },
+            "skill_memory": {
+                "runs": skill_memory_runs,
+                "summary": summarize(skill_memory_runs),
+            },
+        },
     }
 
-    output_path = Path("results/skill_memory_benchmark.json")
+    output_path = Path("results/skill_memory_benchmark_multiseed.json")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
 
-    print("Skill Memory benchmark")
-    for condition in result["conditions"]:
-        print(f"\n[{condition['condition']}]")
-        print(f"final_mse={condition['final_mse']}")
-        print(f"forgetting_mse={condition['forgetting_mse']}")
-        print(f"decisions={condition['decisions']}")
+    for condition_name in ("baseline", "skill_memory"):
+        print(f"\n[{condition_name}]")
+        print(json.dumps(result["conditions"][condition_name]["summary"], indent=2))
 
-    assert skill_memory["decisions"][0]["decision"] == "acquire"
-    assert skill_memory["decisions"][1]["decision"] == "acquire"
-    assert skill_memory["decisions"][2]["decision"] == "reuse:multiply"
-    assert skill_memory["decisions"][3]["decision"] == "acquire"
-    assert skill_memory["stored_skills"] == [
-        "multiply",
-        "add",
-        "square",
-        "divide",
-    ]
+    for run in skill_memory_runs:
+        decisions = [item["decision"] for item in run["decisions"]]
+        assert decisions == ["acquire", "acquire", "reuse:multiply", "acquire"]
+        assert run["stored_skills"] == TASKS
 
     print(f"\nResults written to {output_path}")
 
