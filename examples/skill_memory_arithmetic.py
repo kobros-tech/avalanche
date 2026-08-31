@@ -1,19 +1,4 @@
-"""Arithmetic proof of concept for Skill Memory.
-
-This example uses four supervised regression experiences to demonstrate the
-intended lifecycle:
-
-1. multiplication is learned from scratch (acquisition);
-2. addition is learned from scratch (acquisition);
-3. squaring is learned from a multiplication skill (reuse);
-4. division is deliberately rejected by the compatibility policy (acquisition).
-
-The compatibility policy uses only task descriptors attached to the training
-experience. It never inspects evaluation targets or test data.
-
-The example is deliberately small and deterministic. It is a proof of concept,
-not a benchmark claim.
-"""
+"""Arithmetic proof of concept for Skill Memory."""
 
 from dataclasses import dataclass
 from typing import Dict, Tuple
@@ -43,10 +28,13 @@ class ArithmeticExperience:
     dataset: TensorDataset
     origin_stream: ArithmeticStream
 
+    def logging(self):
+        """Return the experience representation expected by EvaluationPlugin."""
+        return self
+
 
 def make_dataset(operation: str, n_samples: int, seed: int) -> TensorDataset:
-    """Create deterministic train/test data for one arithmetic operation."""
-
+    """Create deterministic train/evaluation data for one arithmetic operation."""
     generator = torch.Generator().manual_seed(seed)
     x = torch.rand(n_samples, 2, generator=generator) * 4.0 + 1.0
     a, b = x[:, 0], x[:, 1]
@@ -68,6 +56,7 @@ def make_dataset(operation: str, n_samples: int, seed: int) -> TensorDataset:
 def make_experience(
     index: int, operation: str, prerequisites: Tuple[str, ...]
 ) -> ArithmeticExperience:
+    """Build one deterministic arithmetic experience."""
     return ArithmeticExperience(
         current_experience=index,
         operation=operation,
@@ -78,22 +67,13 @@ def make_experience(
 
 
 def compatibility(record, experience: ArithmeticExperience) -> float:
-    """Score compatibility from task descriptors only.
-
-    Squaring explicitly declares multiplication as a prerequisite, so a stored
-    multiplication skill is reusable. Division declares no compatible stored
-    prerequisite in this PoC and therefore falls back to new acquisition.
-    """
-
+    """Score compatibility using only stored metadata and task descriptors."""
     operation = record.metadata.get("operation")
-    if operation in experience.prerequisites:
-        return 1.0
-    return 0.0
+    return 1.0 if operation in experience.prerequisites else 0.0
 
 
 def evaluate(model: nn.Module, experience: ArithmeticExperience) -> float:
     """Compute MSE on an independent evaluation set."""
-
     eval_data = make_dataset(
         experience.operation,
         n_samples=64,
@@ -106,6 +86,7 @@ def evaluate(model: nn.Module, experience: ArithmeticExperience) -> float:
 
 
 def main() -> None:
+    """Run the four-stage arithmetic Skill Memory proof of concept."""
     torch.manual_seed(7)
 
     experiences = [
@@ -115,11 +96,7 @@ def main() -> None:
         make_experience(3, "divide", ("division",)),
     ]
 
-    model = nn.Sequential(
-        nn.Linear(2, 16),
-        nn.ReLU(),
-        nn.Linear(16, 1),
-    )
+    model = nn.Sequential(nn.Linear(2, 16), nn.ReLU(), nn.Linear(16, 1))
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
     memory = SkillMemory(max_skills=8)
     decisions: Dict[str, str] = {}
