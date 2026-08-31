@@ -28,12 +28,26 @@ jobs:
         shell: bash -l -c "conda run -n avalanche-env --no-capture-output bash {0}"
     steps:
       - uses: actions/checkout@v3
-      - name: Run Skill Memory tests
+      - name: Run Skill Memory unit tests
         env:
           FAST_TEST: "True"
           USE_GPU: "False"
           PYTHONPATH: ${{ github.workspace }}
         run: |
-          python -m unittest tests.training.skill_memory
-          python -m unittest tests.training.test_skill_memory_integration
+          pytest tests/training/test_skill_memory.py -v \
+            -k "not test_plugin_runs_inside_real_avalanche_training_loop"
+      - name: Run Skill Memory Avalanche integration test
+        env:
+          FAST_TEST: "True"
+          USE_GPU: "False"
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          pytest tests/training/test_skill_memory.py -v \
+            -k "test_plugin_runs_inside_real_avalanche_training_loop"
+      - name: Run Skill Memory example
+        env:
+          FAST_TEST: "True"
+          USE_GPU: "False"
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
           python examples/skill_memory.py

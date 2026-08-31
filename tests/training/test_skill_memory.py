@@ -57,9 +57,7 @@ def test_best_match_rejects_below_threshold():
     model = nn.Linear(1, 1)
     memory.register("skill", model.state_dict())
 
-    record, score = memory.best_match(
-        "query", lambda _, __: 0.4, threshold=0.5
-    )
+    record, score = memory.best_match("query", lambda _, __: 0.4, threshold=0.5)
 
     assert record is None
     assert score == pytest.approx(0.4)
@@ -204,9 +202,9 @@ def test_plugin_runs_inside_real_avalanche_training_loop():
     plugin = SkillMemoryPlugin(
         memory,
         skill_name=lambda exp: f"experience-{exp.current_experience}",
-        compatibility=lambda record, exp: 1.0
-        if record.name == "seed-skill" and exp.current_experience == 0
-        else 0.0,
+        compatibility=lambda record, exp: (
+            1.0 if record.name == "seed-skill" and exp.current_experience == 0 else 0.0
+        ),
         threshold=0.5,
     )
 

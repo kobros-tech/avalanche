@@ -19,9 +19,7 @@ def compatibility(record, experience):
     compatibility estimator rather than inspecting target test labels.
     """
     return (
-        1.0
-        if record.metadata.get("task_id") == experience.current_experience
-        else 0.0
+        1.0 if record.metadata.get("task_id") == experience.current_experience else 0.0
     )
 
 
