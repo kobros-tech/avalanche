@@ -81,7 +81,9 @@ def build_strategy(condition: str):
 
         skill_plugin = SkillMemoryPlugin(
             memory=memory,
-            skill_name=lambda exp: f"rotation_{ROTATIONS[exp.current_experience]}",
+            skill_name=lambda exp: (
+                f"rotation_{ROTATIONS[exp.current_experience]}_exp_{exp.current_experience}"
+            ),
             skill_metadata=lambda exp: metadata(exp.current_experience),
             compatibility=compatibility,
             threshold=REUSE_THRESHOLD,
@@ -140,7 +142,9 @@ def run_condition(condition: str, seed: int) -> Dict:
         )
 
         current = {}
-        for test_experience in benchmark.test_stream[: exp_id + 1]:
+        for test_index, test_experience in enumerate(benchmark.test_stream):
+            if test_index > exp_id:
+                break
             current[str(test_experience.current_experience)] = accuracy(
                 strategy.model, test_experience
             )
@@ -236,8 +240,8 @@ def main() -> None:
             "acquire",
             "acquire",
             "acquire",
-            "reuse:rotation_0",
-            "reuse:rotation_30",
+            "reuse:rotation_0_exp_0",
+            "reuse:rotation_30_exp_1",
         ]
 
     print(json.dumps({k: v["summary"] for k, v in conditions.items()}, indent=2))
