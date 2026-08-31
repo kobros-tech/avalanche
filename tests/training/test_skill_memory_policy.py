@@ -1,3 +1,4 @@
+import pytest
 import torch
 from torch import nn
 
@@ -145,6 +146,78 @@ def test_new_skill_is_registered_after_every_acquisition():
     assert plugin.last_decision == plugin.SCRATCH
     assert memory.contains("task-2")
     assert memory.get("task-2").metadata["acquisition_decision"] == plugin.SCRATCH
+
+
+def test_force_decision_rejects_invalid_value():
+    with pytest.raises(ValueError):
+        SkillMemoryPlugin(SkillMemory(), force_decision="bogus")
+
+
+def test_force_scratch_ignores_a_high_scoring_candidate():
+    memory, source = make_memory()
+    plugin = SkillMemoryPlugin(
+        memory,
+        compatibility=lambda _, __: 0.99,
+        force_decision=SkillMemoryPlugin.SCRATCH,
+    )
+    model = nn.Linear(1, 1)
+    original_weight = model.weight.clone()
+    strategy = Strategy(model, Experience(1))
+
+    plugin.before_training_exp(strategy)
+
+    assert plugin.last_decision == plugin.SCRATCH
+    assert plugin.last_selected_skill is None
+    assert torch.allclose(strategy.model.weight, original_weight)
+    # The score is still recorded for analysis even though it wasn't acted on.
+    assert plugin.last_compatibility_score == pytest.approx(0.99)
+
+
+def test_force_clone_uses_low_scoring_candidate_as_init():
+    memory, source = make_memory()
+    plugin = SkillMemoryPlugin(
+        memory,
+        compatibility=lambda _, __: 0.05,
+        force_decision=SkillMemoryPlugin.CLONE,
+    )
+    strategy = Strategy(nn.Linear(1, 1), Experience(1))
+
+    plugin.before_training_exp(strategy)
+
+    assert plugin.last_decision == plugin.CLONE
+    assert plugin.last_selected_skill == "source"
+    assert plugin.last_reused_skill is None
+    assert torch.allclose(strategy.model.weight, source.weight)
+
+
+def test_force_reuse_uses_low_scoring_candidate_directly():
+    memory, source = make_memory()
+    plugin = SkillMemoryPlugin(
+        memory,
+        compatibility=lambda _, __: 0.05,
+        force_decision=SkillMemoryPlugin.REUSE,
+    )
+    strategy = Strategy(nn.Linear(1, 1), Experience(1))
+
+    plugin.before_training_exp(strategy)
+
+    assert plugin.last_decision == plugin.REUSE
+    assert plugin.last_reused_skill == "source"
+    assert torch.allclose(strategy.model.weight, source.weight)
+
+
+def test_force_clone_or_reuse_with_empty_memory_falls_back_to_scratch():
+    plugin = SkillMemoryPlugin(
+        SkillMemory(),
+        compatibility=lambda _, __: 1.0,
+        force_decision=SkillMemoryPlugin.REUSE,
+    )
+    strategy = Strategy(nn.Linear(1, 1), Experience(0))
+
+    plugin.before_training_exp(strategy)
+
+    assert plugin.last_decision == plugin.SCRATCH
+    assert plugin.last_selected_skill is None
 
 
 def test_thresholds_are_configurable():

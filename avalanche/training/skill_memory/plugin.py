@@ -46,8 +46,17 @@ class SkillMemoryPlugin(SupervisedPlugin):
         threshold: Optional[float] = None,
         replace_existing: bool = False,
         reset_optimizer_on_reuse: bool = False,
+        force_decision: Optional[str] = None,
     ):
         super().__init__()
+        if force_decision is not None and force_decision not in (
+            self.REUSE,
+            self.CLONE,
+            self.SCRATCH,
+        ):
+            raise ValueError(
+                "force_decision must be one of 'reuse', 'clone', 'scratch', or None"
+            )
         if threshold is not None:
             clone_threshold = threshold
         if not 0.0 <= clone_threshold <= 1.0:
@@ -65,6 +74,7 @@ class SkillMemoryPlugin(SupervisedPlugin):
         self.clone_threshold = clone_threshold
         self.replace_existing = replace_existing
         self.reset_optimizer_on_reuse = reset_optimizer_on_reuse
+        self.force_decision = force_decision
 
         self.last_decision: str = self.SCRATCH
         self.last_selected_skill: Optional[str] = None
@@ -72,7 +82,18 @@ class SkillMemoryPlugin(SupervisedPlugin):
         self.last_compatibility_score: float = 0.0
 
     def before_training_exp(self, strategy, **kwargs):
-        """Select the acquisition policy and initialize the active learner."""
+        """Select the acquisition policy and initialize the active learner.
+
+        If ``force_decision`` is set, the score-driven thresholds are
+        bypassed: the best available candidate (if any) is selected as
+        usual, but the REUSE/CLONE/SCRATCH decision is fixed rather than
+        derived from its score. This exists to support oracle-style
+        experiments that ask "what would SCRATCH-only / CLONE-only /
+        REUSE-only have done here?" as a reference for how well the
+        automatic, score-driven policy is doing (see
+        ``examples/skill_memory_policy_oracle.py``). It is not meant to be
+        used for the automatic policy itself.
+        """
 
         self.last_decision = self.SCRATCH
         self.last_selected_skill = None
@@ -82,23 +103,37 @@ class SkillMemoryPlugin(SupervisedPlugin):
         if self.compatibility is None or len(self.memory) == 0:
             return
 
-        # Query at the clone threshold so a candidate in the clone range is
-        # still available for the policy decision.
+        if self.force_decision == self.SCRATCH:
+            # Still compute the score for logging/analysis, but never load a
+            # candidate into the active model.
+            _, self.last_compatibility_score = self.memory.best_match(
+                strategy.experience, self.compatibility, threshold=0.0
+            )
+            return
+
+        # Query at the clone threshold (or 0.0 when a decision is forced) so
+        # a candidate in the clone range is still available for the policy
+        # decision.
+        query_threshold = 0.0 if self.force_decision else self.clone_threshold
         record, score = self.memory.best_match(
             strategy.experience,
             self.compatibility,
-            threshold=self.clone_threshold,
+            threshold=query_threshold,
         )
         self.last_compatibility_score = score
         if record is None:
             return
 
         self.last_selected_skill = record.name
-        if score >= self.reuse_threshold:
-            self.last_decision = self.REUSE
-            self.last_reused_skill = record.name
+        if self.force_decision is not None:
+            decision = self.force_decision
+        elif score >= self.reuse_threshold:
+            decision = self.REUSE
         else:
-            self.last_decision = self.CLONE
+            decision = self.CLONE
+        self.last_decision = decision
+        if decision == self.REUSE:
+            self.last_reused_skill = record.name
 
         # SkillMemory.load_into performs an independent copy, so subsequent
         # training operates on the active model and cannot mutate the source.
