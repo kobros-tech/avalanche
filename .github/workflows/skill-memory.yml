@@ -17,6 +17,8 @@ on:
       - 'examples/skill_memory.py'
       - 'examples/skill_memory_arithmetic.py'
       - 'examples/skill_memory_benchmark.py'
+      - 'examples/skill_memory_policy_oracle.py'
+      - 'examples/skill_memory_standard_benchmark.py'
       - 'docs/skill_memory_benchmark.md'
       - '.github/workflows/skill-memory.yml'
 
@@ -40,6 +42,7 @@ jobs:
           pytest -n 0 tests/training/test_skill_memory.py -v \
             -k "not test_plugin_runs_inside_real_avalanche_training_loop"
           pytest -n 0 tests/training/test_skill_memory_policy.py -v
+          pytest -n 0 tests/training/test_skill_memory_compatibility.py -v
       - name: Run Skill Memory Avalanche integration test
         env:
           FAST_TEST: "True"
@@ -69,8 +72,32 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}
         run: |
           python examples/skill_memory_benchmark.py
+      - name: Run Skill Memory policy oracle comparison
+        env:
+          FAST_TEST: "True"
+          USE_GPU: "False"
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python examples/skill_memory_policy_oracle.py
+      - name: Run standard RotatedMNIST benchmark (FAST_TEST-sized)
+        env:
+          FAST_TEST: "True"
+          USE_GPU: "False"
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python examples/skill_memory_standard_benchmark.py
       - name: Upload multi-seed benchmark result
         uses: actions/upload-artifact@v4
         with:
           name: skill-memory-benchmark-multiseed
           path: results/skill_memory_benchmark_multiseed.json
+      - name: Upload policy oracle result
+        uses: actions/upload-artifact@v4
+        with:
+          name: skill-memory-policy-oracle
+          path: results/skill_memory_arithmetic_policy_oracle.json
+      - name: Upload standard RotatedMNIST result
+        uses: actions/upload-artifact@v4
+        with:
+          name: skill-memory-rotated-mnist
+          path: results/skill_memory_rotated_mnist.json
