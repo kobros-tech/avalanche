@@ -2,7 +2,10 @@ import pytest
 import torch
 from torch import nn
 
+from avalanche.models import SimpleMLP
 from avalanche.training.skill_memory import SkillMemory, SkillMemoryPlugin
+from avalanche.training.supervised import Naive
+from tests.unit_tests_utils import get_fast_benchmark
 
 
 class DummyExperience:
@@ -133,7 +136,9 @@ def test_plugin_does_not_overwrite_existing_skill_by_default():
     strategy.experience = DummyExperience(1)
     plugin.after_training_exp(strategy)
 
-    assert torch.allclose(memory.get("task-1").state_dict["weight"], torch.ones_like(model.weight))
+    assert torch.allclose(
+        memory.get("task-1").state_dict["weight"], torch.ones_like(model.weight)
+    )
     assert memory.get("task-1").metadata == {}
 
 
@@ -179,3 +184,44 @@ def test_plugin_falls_back_when_no_skill_is_compatible():
 
     assert plugin.last_reused_skill is None
     assert plugin.last_compatibility_score == pytest.approx(0.1)
+
+
+def test_plugin_runs_inside_real_avalanche_training_loop():
+    """Check that the plugin is invoked by Naive, not only by direct calls."""
+
+    benchmark = get_fast_benchmark()
+    model = SimpleMLP(input_size=6, hidden_size=10)
+    optimizer = torch.optim.SGD(model.parameters(), lr=1e-3)
+    criterion = nn.CrossEntropyLoss()
+
+    memory = SkillMemory()
+    source = SimpleMLP(input_size=6, hidden_size=10)
+    with torch.no_grad():
+        for parameter in source.parameters():
+            parameter.fill_(0.25)
+    memory.register("seed-skill", source.state_dict())
+
+    plugin = SkillMemoryPlugin(
+        memory,
+        skill_name=lambda exp: f"experience-{exp.current_experience}",
+        compatibility=lambda record, exp: 1.0
+        if record.name == "seed-skill" and exp.current_experience == 0
+        else 0.0,
+        threshold=0.5,
+    )
+
+    strategy = Naive(
+        model=model,
+        optimizer=optimizer,
+        criterion=criterion,
+        train_mb_size=16,
+        train_epochs=1,
+        eval_every=-1,
+        plugins=[plugin],
+    )
+
+    strategy.train(benchmark.train_stream[0])
+
+    assert plugin.last_reused_skill == "seed-skill"
+    assert memory.contains("experience-0")
+    assert memory.get("experience-0").metadata["reused_from"] == "seed-skill"
