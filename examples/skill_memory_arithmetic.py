@@ -27,6 +27,13 @@ from avalanche.training.skill_memory import SkillMemory, SkillMemoryPlugin
 
 
 @dataclass
+class ArithmeticStream:
+    """Minimal stream descriptor required by Avalanche's training template."""
+
+    name: str
+
+
+@dataclass
 class ArithmeticExperience:
     """Minimal Avalanche-compatible supervised experience for this PoC."""
 
@@ -34,6 +41,7 @@ class ArithmeticExperience:
     operation: str
     prerequisites: Tuple[str, ...]
     dataset: TensorDataset
+    origin_stream: ArithmeticStream
 
 
 def make_dataset(operation: str, n_samples: int, seed: int) -> TensorDataset:
@@ -57,12 +65,15 @@ def make_dataset(operation: str, n_samples: int, seed: int) -> TensorDataset:
     return TensorDataset(x, y.unsqueeze(1))
 
 
-def make_experience(index: int, operation: str, prerequisites: Tuple[str, ...]) -> ArithmeticExperience:
+def make_experience(
+    index: int, operation: str, prerequisites: Tuple[str, ...]
+) -> ArithmeticExperience:
     return ArithmeticExperience(
         current_experience=index,
         operation=operation,
         prerequisites=prerequisites,
         dataset=make_dataset(operation, n_samples=64, seed=100 + index),
+        origin_stream=ArithmeticStream(name="arithmetic_train"),
     )
 
 
@@ -142,7 +153,7 @@ def main() -> None:
     )
 
     for experience in experiences:
-        strategy.train(experience)
+        strategy.train(experience, eval_streams=[])
         decision = (
             f"reuse:{plugin.last_reused_skill}"
             if plugin.last_reused_skill is not None
