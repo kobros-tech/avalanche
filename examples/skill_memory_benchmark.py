@@ -35,6 +35,7 @@ TRAIN_SEED_BASE = 100
 EVAL_SEED_BASE = 10_000
 EPOCHS = 3
 TASKS = ["multiply", "add", "square", "divide"]
+FORGETTING_TASKS = TASKS[:-1]
 
 
 @dataclass
@@ -196,7 +197,7 @@ def run_condition(use_skill_memory: bool, seed: int) -> Dict:
 
     final_mse = mse_history[-1]
     forgetting = {}
-    for operation in TASKS[:-1]:
+    for operation in FORGETTING_TASKS:
         values = [row[operation] for row in mse_history if operation in row]
         forgetting[operation] = max(0.0, values[-1] - min(values))
 
@@ -242,7 +243,7 @@ def summarize(runs: List[Dict]) -> Dict:
         }
 
     summary["forgetting_mse"] = {}
-    for task in TASKS[:-1]:
+    for task in FORGETTING_TASKS:
         values = [run["forgetting_mse"][task] for run in runs]
         summary["forgetting_mse"][task] = {
             "mean": mean(values),
@@ -256,13 +257,10 @@ def summarize(runs: List[Dict]) -> Dict:
 def paired_metric_summary(
     baseline_runs: List[Dict], skill_memory_runs: List[Dict], metric: str
 ) -> Dict:
-    """Summarize paired Skill Memory minus baseline differences by task.
-
-    The same seed is compared across both conditions, so this is a paired
-    comparison rather than an independent-samples comparison.
-    """
+    """Summarize paired Skill Memory minus baseline differences by task."""
+    tasks = TASKS if metric == "final_mse" else FORGETTING_TASKS
     result = {}
-    for task in TASKS:
+    for task in tasks:
         if metric == "final_mse":
             baseline_values = [run["final_mse"][task] for run in baseline_runs]
             skill_values = [run["final_mse"][task] for run in skill_memory_runs]
@@ -308,6 +306,7 @@ def main() -> None:
             "forgetting_mse": "max(0, final MSE - minimum MSE observed after any experience for that task).",
             "paired_difference": "Skill Memory metric minus baseline metric for the same seed.",
             "confidence_interval": "Approximate 95% CI using mean +/- 1.96 * sample SD / sqrt(n).",
+            "forgetting_scope": "Only previously encountered tasks (multiply, add, square); divide is excluded because there is no later experience after it to measure forgetting.",
         },
         "conditions": {
             "baseline": {
