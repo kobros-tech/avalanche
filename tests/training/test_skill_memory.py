@@ -62,6 +62,18 @@ def test_best_match_rejects_below_threshold():
     assert score == pytest.approx(0.4)
 
 
+def test_best_match_rejects_invalid_threshold_and_nonfinite_score():
+    memory = SkillMemory()
+    model = nn.Linear(1, 1)
+    memory.register("skill", model.state_dict())
+
+    with pytest.raises(ValueError, match="threshold"):
+        memory.best_match("query", lambda _, __: 1.0, threshold=1.1)
+
+    with pytest.raises(ValueError, match="finite"):
+        memory.best_match("query", lambda _, __: float("nan"))
+
+
 def test_memory_capacity_is_enforced():
     memory = SkillMemory(max_skills=1)
     model = nn.Linear(1, 1)
@@ -71,7 +83,7 @@ def test_memory_capacity_is_enforced():
         memory.register("second", model.state_dict())
 
 
-def test_plugin_reuses_and_then_registers_skill():
+def test_plugin_reuses_and_then_registers_skill_with_metadata():
     source = nn.Linear(1, 1)
     target = nn.Linear(1, 1)
     with torch.no_grad():
@@ -84,6 +96,7 @@ def test_plugin_reuses_and_then_registers_skill():
     plugin = SkillMemoryPlugin(
         memory,
         skill_name=lambda exp: f"task-{exp.current_experience}",
+        skill_metadata=lambda exp: {"task_id": exp.current_experience},
         compatibility=lambda record, exp: 1.0 if exp.current_experience == 1 else 0.0,
         threshold=0.5,
     )
@@ -97,7 +110,55 @@ def test_plugin_reuses_and_then_registers_skill():
 
     plugin.after_training_exp(strategy)
     assert memory.contains("task-1")
+    assert memory.get("task-1").metadata["task_id"] == 1
     assert memory.get("task-1").metadata["reused_from"] == "source"
+
+
+def test_plugin_does_not_overwrite_existing_skill_by_default():
+    memory = SkillMemory()
+    model = nn.Linear(1, 1)
+    with torch.no_grad():
+        model.weight.fill_(1.0)
+    memory.register("task-1", model.state_dict())
+
+    with torch.no_grad():
+        model.weight.fill_(9.0)
+
+    plugin = SkillMemoryPlugin(
+        memory,
+        skill_name=lambda exp: "task-1",
+        skill_metadata=lambda _: {"version": 2},
+    )
+    strategy = DummyStrategy(model)
+    strategy.experience = DummyExperience(1)
+    plugin.after_training_exp(strategy)
+
+    assert torch.allclose(memory.get("task-1").state_dict["weight"], torch.ones_like(model.weight))
+    assert memory.get("task-1").metadata == {}
+
+
+def test_plugin_can_replace_existing_skill_explicitly():
+    memory = SkillMemory()
+    model = nn.Linear(1, 1)
+    with torch.no_grad():
+        model.weight.fill_(1.0)
+    memory.register("task-1", model.state_dict())
+
+    with torch.no_grad():
+        model.weight.fill_(9.0)
+
+    plugin = SkillMemoryPlugin(
+        memory,
+        skill_name=lambda exp: "task-1",
+        skill_metadata=lambda _: {"version": 2},
+        replace_existing=True,
+    )
+    strategy = DummyStrategy(model)
+    strategy.experience = DummyExperience(1)
+    plugin.after_training_exp(strategy)
+
+    assert torch.allclose(memory.get("task-1").state_dict["weight"], model.weight)
+    assert memory.get("task-1").metadata["version"] == 2
 
 
 def test_plugin_falls_back_when_no_skill_is_compatible():
