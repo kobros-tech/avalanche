@@ -20,12 +20,13 @@ The model and optimizer are initialized from the same random seed for each condi
 | 0 | multiplication | acquire |
 | 1 | addition | acquire |
 | 2 | square | reuse `multiply` |
-| 3 | division | reject incompatible skills, then acquire |
+| 3 | division | no compatible prerequisite, then acquire |
 
 The compatibility function is deliberately explicit: it matches a stored operation only
 when that operation appears in the current training experience's prerequisite list.
-This isolates the memory/reuse mechanism; it does **not** claim that the compatibility
-function is a learned task-similarity model.
+Square declares `multiply` as its prerequisite. Division declares no prerequisites, so it
+cannot reuse an existing skill in this controlled benchmark. This isolates the memory/reuse
+mechanism; it does **not** claim that the compatibility function is a learned task-similarity model.
 
 ## Evaluation protocol
 
@@ -37,21 +38,41 @@ For every experience, the benchmark evaluates all tasks seen so far. The recorde
 
 - final MSE for each task;
 - MSE history after each experience;
-- per-task forgetting, measured as the increase from that task's best observed MSE to its final MSE;
+- per-task forgetting, measured as `max(0, final MSE - minimum MSE observed after any experience for that task)`;
 - Skill Memory decision and compatibility score for every experience;
 - stored skill names.
 
-The output is written to `results/skill_memory_benchmark.json`.
+The 15-seed benchmark additionally reports mean, sample standard deviation, and an approximate
+95% confidence interval for each condition. It also reports paired differences (`Skill Memory - baseline`)
+for each seed, along with the number of seeds won by each condition. Pairing by seed is important because
+the same seed defines the corresponding baseline and Skill Memory run.
+
+## Multi-seed benchmark
+
+The development benchmark uses fixed seeds `0..14`. It should be interpreted as a robustness check
+for the controlled arithmetic result, not as evidence of general continual-learning superiority.
+
+The most important comparison is the paired forgetting difference. Negative values mean Skill Memory
+has less forgetting than baseline. Final MSE is reported separately because lower forgetting does not
+necessarily imply lower final task error.
+
+The benchmark output is written to `results/skill_memory_benchmark_multiseed.json`.
 
 ## Interpretation
 
-The benchmark is useful only if it produces a measurable difference under the same training
-budget. A successful run proves that the integration works and records the observed result;
-it does **not** by itself establish a statistically significant research claim.
+A successful run proves that the integration works and records the observed result; it does **not**
+by itself establish a statistically significant research claim.
 
-If the result is promising, the next step is a multi-seed benchmark with confidence intervals,
-followed by broader task families in the research repository. If there is no measurable benefit,
-that result should be recorded rather than forcing an upstream contribution.
+The arithmetic experiment is designed to answer two separate questions:
+
+1. Does Skill Memory reliably make the intended reuse decision across seeds?
+2. Does that reuse mechanism change continual-learning behavior, especially forgetting?
+
+A positive forgetting result should not be described as a general improvement until it is reproduced
+on a standard Avalanche continual-learning benchmark with an appropriate baseline.
+
+The next step after this controlled multi-seed analysis is a broader benchmark in a standard Avalanche
+scenario.
 
 ## Running
 
@@ -61,5 +82,5 @@ From the repository root:
 python examples/skill_memory_benchmark.py
 ```
 
-The script is deterministic with respect to the configured seed and writes a machine-readable
-JSON result suitable for later aggregation across seeds.
+The script is deterministic with respect to the configured seeds and writes a machine-readable JSON
+result suitable for paired analysis across the baseline and Skill Memory conditions.
