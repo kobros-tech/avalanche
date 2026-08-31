@@ -17,6 +17,7 @@ on:
       - 'examples/skill_memory.py'
       - 'examples/skill_memory_arithmetic.py'
       - 'examples/skill_memory_benchmark.py'
+      - 'examples/skill_memory_standard_benchmark.py'
       - 'docs/skill_memory_benchmark.md'
       - '.github/workflows/skill-memory.yml'
 
@@ -68,8 +69,20 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}
         run: |
           python examples/skill_memory_benchmark.py
+      - name: Run standard RotatedMNIST benchmark
+        env:
+          FAST_TEST: "True"
+          USE_GPU: "False"
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python examples/skill_memory_standard_benchmark.py
       - name: Upload multi-seed benchmark result
         uses: actions/upload-artifact@v4
         with:
           name: skill-memory-benchmark-multiseed
           path: results/skill_memory_benchmark_multiseed.json
+      - name: Upload standard RotatedMNIST result
+        uses: actions/upload-artifact@v4
+        with:
+          name: skill-memory-rotated-mnist
+          path: results/skill_memory_rotated_mnist.json
