@@ -7,6 +7,16 @@ The benchmark compares otherwise identical continual-learning runs:
 
 The evaluation set is generated independently and is never passed to the
 compatibility decision.
+
+Compatibility is scored with :class:`ProbeCompatibilityScorer`: each
+candidate skill's zero-shot MSE on a small probe drawn from the new
+experience's own training distribution (a fresh sample, not the actual
+training minibatches or the eval set) is compared against a mean-predictor
+reference. This intentionally replaces an earlier binary "is this operation a
+declared prerequisite?" lookup, which could only ever return exactly 0.0 or
+1.0 and therefore could never land inside the CLONE band -- see
+``docs/skill_memory_benchmark.md`` ("Why probe-based compatibility") for the
+full rationale.
 """
 
 from __future__ import annotations
@@ -22,17 +32,34 @@ from torch import nn
 from torch.utils.data import Dataset
 
 from avalanche.training import Naive
-from avalanche.training.skill_memory import SkillMemory, SkillMemoryPlugin
+from avalanche.training.skill_memory import (
+    ProbeCompatibilityScorer,
+    SkillMemory,
+    SkillMemoryPlugin,
+    mean_baseline_mse,
+)
 
 
 SEEDS = list(range(15))
 TRAIN_SAMPLES = 64
 EVAL_SAMPLES = 64
+PROBE_SAMPLES = 16
 TRAIN_SEED_BASE = 100
 EVAL_SEED_BASE = 10_000
+PROBE_SEED_BASE = 50_000
 EPOCHS = 3
 TASKS = ["multiply", "add", "square", "divide"]
 FORGETTING_TASKS = TASKS[:-1]
+REUSE_THRESHOLD = 0.90
+CLONE_THRESHOLD = 0.30
+
+
+def make_model() -> nn.Module:
+    return nn.Sequential(
+        nn.Linear(2, 16),
+        nn.ReLU(),
+        nn.Linear(16, 1),
+    )
 
 
 @dataclass
@@ -102,12 +129,6 @@ def make_experience(index: int, operation: str, prerequisites: Tuple[str, ...], 
     )
 
 
-def compatibility(record, experience: ArithmeticExperience) -> float:
-    # This score uses only training-experience metadata. A direct prerequisite
-    # is deliberately treated as a high-compatibility transfer candidate.
-    return float(record.metadata.get("operation") in experience.prerequisites)
-
-
 def evaluate(model: nn.Module, operation: str, seed: int) -> float:
     dataset = make_dataset(
         operation,
@@ -120,12 +141,27 @@ def evaluate(model: nn.Module, operation: str, seed: int) -> float:
         return float(nn.functional.mse_loss(predictions, dataset.tensors[1]))
 
 
-def build_strategy(use_skill_memory: bool):
-    model = nn.Sequential(
-        nn.Linear(2, 16),
-        nn.ReLU(),
-        nn.Linear(16, 1),
+def probe_batch(experience: ArithmeticExperience, seed: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """A small, freshly sampled probe from the new experience's own task.
+
+    Uses the same operation and a seed derived from the run seed, but a
+    disjoint sample range from both the actual training minibatches and the
+    evaluation set (``PROBE_SEED_BASE`` vs ``TRAIN_SEED_BASE``/
+    ``EVAL_SEED_BASE``). This is legitimate at decision time: the plugin is
+    told the new experience's operation before training on it (that is the
+    whole premise of "should I reuse/clone/scratch for this task?"), it just
+    must not see the held-out evaluation samples.
+    """
+    dataset = make_dataset(
+        experience.operation,
+        PROBE_SAMPLES,
+        PROBE_SEED_BASE + seed * len(TASKS) + experience.current_experience,
     )
+    return dataset.tensors
+
+
+def build_strategy(use_skill_memory: bool, seed: int, force_decision: str = None):
+    model = make_model()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
     plugins = []
     memory = None
@@ -140,13 +176,21 @@ def build_strategy(use_skill_memory: bool):
                 "prerequisites": list(exp.prerequisites),
             }
 
+        compatibility = ProbeCompatibilityScorer(
+            model_factory=make_model,
+            loss_fn=nn.functional.mse_loss,
+            probe_fn=lambda exp: probe_batch(exp, seed),
+            reference_fn=lambda exp: mean_baseline_mse(probe_batch(exp, seed)[1]),
+        )
+
         skill_plugin = SkillMemoryPlugin(
             memory=memory,
             skill_name=lambda exp: exp.operation,
             skill_metadata=metadata,
             compatibility=compatibility,
-            reuse_threshold=0.90,
-            clone_threshold=0.30,
+            reuse_threshold=REUSE_THRESHOLD,
+            clone_threshold=CLONE_THRESHOLD,
+            force_decision=force_decision,
         )
         plugins.append(skill_plugin)
 
@@ -163,9 +207,9 @@ def build_strategy(use_skill_memory: bool):
     return strategy, memory, skill_plugin
 
 
-def run_condition(use_skill_memory: bool, seed: int) -> Dict:
+def run_condition(use_skill_memory: bool, seed: int, force_decision: str = None) -> Dict:
     torch.manual_seed(seed)
-    strategy, memory, plugin = build_strategy(use_skill_memory)
+    strategy, memory, plugin = build_strategy(use_skill_memory, seed, force_decision=force_decision)
 
     experiences = [
         make_experience(0, "multiply", (), seed),
@@ -307,11 +351,16 @@ def main() -> None:
     skill_memory_runs = [item["skill_memory"] for item in results]
 
     result = {
-        "benchmark": "skill_memory_arithmetic_multiseed_v3",
-        "description": "15-seed controlled baseline vs automatic score-driven Skill Memory benchmark.",
+        "benchmark": "skill_memory_arithmetic_multiseed_v4",
+        "description": (
+            "15-seed controlled baseline vs automatic score-driven Skill Memory "
+            "benchmark, using ProbeCompatibilityScorer (continuous, zero-shot-"
+            "probe-based compatibility) instead of a binary prerequisite lookup."
+        ),
         "policy": {
-            "reuse_threshold": 0.90,
-            "clone_threshold": 0.30,
+            "reuse_threshold": REUSE_THRESHOLD,
+            "clone_threshold": CLONE_THRESHOLD,
+            "compatibility": "ProbeCompatibilityScorer (zero-shot MSE vs mean-baseline reference)",
         },
         "seeds": SEEDS,
         "metric_definitions": {
@@ -346,7 +395,17 @@ def main() -> None:
 
     for run in skill_memory_runs:
         decisions = [item["decision"] for item in run["decisions"]]
-        assert decisions == ["scratch", "scratch", "reuse:multiply", "scratch"]
+        # The first experience always starts from an empty memory, so it must
+        # be SCRATCH. Beyond that, decisions vary by seed now that the score
+        # is a real probe measurement rather than a fixed binary lookup -- see
+        # docs/skill_memory_benchmark.md for what this run actually found.
+        assert decisions[0] == "scratch"
+        for decision in decisions:
+            assert (
+                decision == "scratch"
+                or decision.startswith("clone:")
+                or decision.startswith("reuse:")
+            )
         assert run["stored_skills"] == TASKS
 
     print(f"\nResults written to {output_path}")
