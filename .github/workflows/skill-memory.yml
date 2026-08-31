@@ -61,15 +61,15 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}
         run: |
           python examples/skill_memory_arithmetic.py
-      - name: Run controlled Skill Memory benchmark
+      - name: Run controlled multi-seed Skill Memory benchmark
         env:
           FAST_TEST: "True"
           USE_GPU: "False"
           PYTHONPATH: ${{ github.workspace }}
         run: |
           python examples/skill_memory_benchmark.py
-      - name: Upload benchmark result
+      - name: Upload multi-seed benchmark result
         uses: actions/upload-artifact@v4
         with:
-          name: skill-memory-benchmark
-          path: results/skill_memory_benchmark.json
+          name: skill-memory-benchmark-multiseed
+          path: results/skill_memory_benchmark_multiseed.json
