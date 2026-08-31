@@ -16,6 +16,8 @@ on:
     branches:
       - master
       - detection
+      # TEMPORARY: local fork validation only. Do not merge upstream.
+      - feature/skill-memory-prototype
     paths:
       - '**.py'
       - '.github/workflows/unit-test.yml'
