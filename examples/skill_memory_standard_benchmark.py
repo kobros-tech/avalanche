@@ -74,7 +74,16 @@ def build_strategy(condition: str):
         memory = SkillMemory(max_skills=MEMORY_MAX_SKILLS)
 
         def compatibility(record, query):
-            return 1.0 if record.metadata["rotation"] == query["rotation"] else 0.0
+            """Score a stored skill against an Avalanche experience.
+
+            ``SkillMemoryPlugin`` passes the actual Avalanche experience as the
+            query. The experiment's task descriptor is known from the training
+            benchmark definition, so compatibility can derive the rotation
+            without relying on test data or converting the experience to a
+            dictionary.
+            """
+            query_rotation = ROTATIONS[query.current_experience]
+            return 1.0 if record.metadata["rotation"] == query_rotation else 0.0
 
         def metadata(exp_index: int):
             return {"rotation": ROTATIONS[exp_index]}
