@@ -27,3 +27,4 @@ from .update_ncm import *
 from .update_fecam import *
 from .feature_distillation import *
 from .il2m import IL2MPlugin
+from avalanche.training.skill_memory import SkillMemoryPlugin
