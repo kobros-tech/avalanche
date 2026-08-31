@@ -16,6 +16,8 @@ on:
       - 'tests/**'
       - 'examples/skill_memory.py'
       - 'examples/skill_memory_arithmetic.py'
+      - 'examples/skill_memory_benchmark.py'
+      - 'docs/skill_memory_benchmark.md'
       - '.github/workflows/skill-memory.yml'
 
 jobs:
@@ -59,3 +61,15 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}
         run: |
           python examples/skill_memory_arithmetic.py
+      - name: Run controlled Skill Memory benchmark
+        env:
+          FAST_TEST: "True"
+          USE_GPU: "False"
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python examples/skill_memory_benchmark.py
+      - name: Upload benchmark result
+        uses: actions/upload-artifact@v4
+        with:
+          name: skill-memory-benchmark
+          path: results/skill_memory_benchmark.json
