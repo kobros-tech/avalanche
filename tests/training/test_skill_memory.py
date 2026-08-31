@@ -20,6 +20,15 @@ class DummyStrategy:
         self.optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
 
 
+def test_empty_memory_returns_no_match():
+    memory = SkillMemory()
+
+    record, score = memory.best_match("query", lambda _, __: 1.0, threshold=0.5)
+
+    assert record is None
+    assert score == pytest.approx(0.0)
+
+
 def test_register_copies_state_to_cpu_and_is_independent():
     memory = SkillMemory(max_skills=2)
     model = nn.Linear(2, 1)
@@ -52,6 +61,19 @@ def test_best_match_selects_highest_score_above_threshold():
     assert score == pytest.approx(0.9)
 
 
+def test_best_match_tie_break_is_deterministic():
+    memory = SkillMemory()
+    model = nn.Linear(1, 1)
+    memory.register("first", model.state_dict())
+    memory.register("second", model.state_dict())
+
+    for _ in range(3):
+        record, score = memory.best_match("query", lambda _, __: 0.8, threshold=0.5)
+        assert record is not None
+        assert record.name == "first"
+        assert score == pytest.approx(0.8)
+
+
 def test_best_match_rejects_below_threshold():
     memory = SkillMemory()
     model = nn.Linear(1, 1)
@@ -82,6 +104,26 @@ def test_memory_capacity_is_enforced():
 
     with pytest.raises(RuntimeError, match="at capacity"):
         memory.register("second", model.state_dict())
+
+
+def test_memory_state_round_trip_preserves_skills_and_metadata():
+    source = nn.Linear(2, 1)
+    with torch.no_grad():
+        source.weight.fill_(3.0)
+        source.bias.fill_(2.0)
+
+    original = SkillMemory(max_skills=3)
+    original.register("a", source.state_dict(), metadata={"task": 1})
+    original.register("b", source.state_dict(), metadata={"task": 2})
+
+    restored = SkillMemory()
+    restored.load_state_dict(original.state_dict())
+
+    assert restored.max_skills == 3
+    assert restored.names() == ["a", "b"]
+    assert restored.get("a").metadata == {"task": 1}
+    for key, value in original.get("a").state_dict.items():
+        assert torch.equal(value, restored.get("a").state_dict[key])
 
 
 def test_plugin_reuses_and_then_registers_skill_with_metadata():
@@ -182,6 +224,81 @@ def test_plugin_falls_back_when_no_skill_is_compatible():
 
     assert plugin.last_reused_skill is None
     assert plugin.last_compatibility_score == pytest.approx(0.1)
+
+
+def test_plugin_runs_across_sequential_experiences():
+    """Check reuse and acquisition decisions across two real experiences."""
+
+    benchmark = get_fast_benchmark()
+    model = SimpleMLP(input_size=6, hidden_size=10)
+    optimizer = torch.optim.SGD(model.parameters(), lr=1e-3)
+    criterion = nn.CrossEntropyLoss()
+    memory = SkillMemory()
+    seen = []
+
+    def compatibility(record, exp):
+        seen.append(exp.current_experience)
+        if exp.current_experience == 1 and record.name == "experience-0":
+            return 1.0
+        return 0.0
+
+    plugin = SkillMemoryPlugin(
+        memory,
+        skill_name=lambda exp: f"experience-{exp.current_experience}",
+        compatibility=compatibility,
+        threshold=0.5,
+    )
+    strategy = Naive(
+        model=model,
+        optimizer=optimizer,
+        criterion=criterion,
+        train_mb_size=16,
+        train_epochs=1,
+        eval_every=-1,
+        plugins=[plugin],
+    )
+
+    strategy.train(benchmark.train_stream[0])
+    assert plugin.last_reused_skill is None
+    assert memory.contains("experience-0")
+
+    strategy.train(benchmark.train_stream[1])
+    assert plugin.last_reused_skill == "experience-0"
+    assert memory.contains("experience-1")
+    assert seen == [0, 1]
+
+
+def test_plugin_does_not_query_memory_during_eval():
+    """Compatibility checks happen on training experiences, not test data."""
+
+    benchmark = get_fast_benchmark()
+    model = SimpleMLP(input_size=6, hidden_size=10)
+    optimizer = torch.optim.SGD(model.parameters(), lr=1e-3)
+    criterion = nn.CrossEntropyLoss()
+    memory = SkillMemory()
+    calls = []
+
+    def compatibility(record, exp):
+        calls.append(exp.current_experience)
+        return 0.0
+
+    plugin = SkillMemoryPlugin(memory, compatibility=compatibility, threshold=0.5)
+    strategy = Naive(
+        model=model,
+        optimizer=optimizer,
+        criterion=criterion,
+        train_mb_size=16,
+        train_epochs=1,
+        eval_every=-1,
+        plugins=[plugin],
+    )
+
+    strategy.train(benchmark.train_stream[0])
+    train_call_count = len(calls)
+    strategy.eval(benchmark.test_stream[0])
+
+    assert train_call_count > 0
+    assert len(calls) == train_call_count
 
 
 def test_plugin_runs_inside_real_avalanche_training_loop():
