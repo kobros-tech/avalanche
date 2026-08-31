@@ -15,6 +15,7 @@ on:
       - 'tests/training/**'
       - 'tests/**'
       - 'examples/skill_memory.py'
+      - 'examples/skill_memory_arithmetic.py'
       - '.github/workflows/skill-memory.yml'
 
 jobs:
@@ -44,10 +45,17 @@ jobs:
         run: |
           pytest -n 0 tests/training/test_skill_memory.py -v \
             -k "test_plugin_runs_inside_real_avalanche_training_loop"
-      - name: Run Skill Memory example
+      - name: Run generic Skill Memory example
         env:
           FAST_TEST: "True"
           USE_GPU: "False"
           PYTHONPATH: ${{ github.workspace }}
         run: |
           python examples/skill_memory.py
+      - name: Run arithmetic proof of concept
+        env:
+          FAST_TEST: "True"
+          USE_GPU: "False"
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python examples/skill_memory_arithmetic.py
