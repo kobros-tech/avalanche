@@ -46,6 +46,34 @@ def test_adaptation_scorer_detects_useful_initialization():
     assert score <= 1.0
 
 
+def test_adaptation_scorer_matches_minibatch_update_structure():
+    """12 updates must consume four 16-sample batches for three epochs."""
+    model = factory()
+    x = torch.arange(1.0, 65.0).reshape(-1, 1)
+    y = 3.0 * x
+    seen_batch_sizes = []
+
+    def recording_loss(prediction, target):
+        seen_batch_sizes.append(len(target))
+        return nn.functional.mse_loss(prediction, target)
+
+    scorer = AdaptationCompatibilityScorer(
+        model_factory=factory,
+        loss_fn=recording_loss,
+        probe_fn=lambda _: (x, y),
+        adaptation_fn=lambda _: (x, y),
+        batch_size=16,
+        steps=12,
+        optimizer_factory=lambda parameters: torch.optim.SGD(parameters, lr=0.01),
+    )
+
+    scorer._adapt(model, x, y)
+
+    # Twelve optimizer updates use 12 minibatches of 16. The final loss
+    # inspection is over the complete adaptation set and is not an update.
+    assert seen_batch_sizes == [16] * 12 + [64]
+
+
 def test_automatic_policy_uses_adaptation_value_for_clone():
     memory = SkillMemory()
     source = factory()
