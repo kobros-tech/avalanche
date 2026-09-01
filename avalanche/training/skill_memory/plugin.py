@@ -1,4 +1,4 @@
-"""Avalanche plugin for automatic score-driven skill acquisition."""
+"""Avalanche plugin for score-driven skill acquisition."""
 
 from __future__ import annotations
 
@@ -10,22 +10,16 @@ from .memory import SkillMemory, SkillRecord
 
 
 class SkillMemoryPlugin(SupervisedPlugin):
-    """Automatically choose REUSE, CLONE, or SCRATCH for each experience.
+    """Choose REUSE, CLONE, or SCRATCH for each sequential experience.
 
-    A learned skill is stored as an independent model-state copy in
-    :class:`SkillMemory`. For each new training experience the best stored
-    candidate is scored. The score itself is the trigger:
+    REUSE does not train the selected source skill. CLONE copies the selected
+    source into a new acquisition state and then trains that independent copy.
+    SCRATCH trains a fresh acquisition state. The registry itself remains
+    immutable.
 
-    * score >= ``reuse_threshold`` -> REUSE
-    * ``clone_threshold`` <= score < ``reuse_threshold`` -> CLONE
-    * score < ``clone_threshold`` or no candidate -> SCRATCH
-
-    REUSE and CLONE both initialize the active learner from an independent
-    copy of the selected skill. Training therefore never mutates the stored
-    source skill. The distinction is the policy decision and its recorded
-    provenance: REUSE treats the candidate as sufficiently compatible for
-    direct reuse, while CLONE treats it as useful initialization that must be
-    adapted by training on the new experience.
+    This plugin provides the generic policy/lifecycle layer. Architectures that
+    reserve explicit neuron/parameter slots can additionally use the slot
+    adapter described in ``docs/skill_memory_algorithm.md``.
     """
 
     REUSE = "reuse"
@@ -41,18 +35,15 @@ class SkillMemoryPlugin(SupervisedPlugin):
         skill_metadata: Optional[Callable[[Any], Mapping[str, Any]]] = None,
         reuse_threshold: float = 0.90,
         clone_threshold: float = 0.30,
-        # Kept for compatibility with the prototype API. When supplied, it
-        # acts as the clone threshold unless the new thresholds are explicit.
         threshold: Optional[float] = None,
         replace_existing: bool = False,
         reset_optimizer_on_reuse: bool = False,
         force_decision: Optional[str] = None,
+        train_on_reuse: bool = False,
     ):
         super().__init__()
         if force_decision is not None and force_decision not in (
-            self.REUSE,
-            self.CLONE,
-            self.SCRATCH,
+            self.REUSE, self.CLONE, self.SCRATCH
         ):
             raise ValueError(
                 "force_decision must be one of 'reuse', 'clone', 'scratch', or None"
@@ -75,75 +66,71 @@ class SkillMemoryPlugin(SupervisedPlugin):
         self.replace_existing = replace_existing
         self.reset_optimizer_on_reuse = reset_optimizer_on_reuse
         self.force_decision = force_decision
+        self.train_on_reuse = train_on_reuse
 
         self.last_decision: str = self.SCRATCH
         self.last_selected_skill: Optional[str] = None
         self.last_reused_skill: Optional[str] = None
         self.last_compatibility_score: float = 0.0
+        self._saved_train_epochs: Optional[int] = None
 
     def before_training_exp(self, strategy, **kwargs):
-        """Select the acquisition policy and initialize the active learner.
-
-        If ``force_decision`` is set, the score-driven thresholds are
-        bypassed: the best available candidate (if any) is selected as
-        usual, but the REUSE/CLONE/SCRATCH decision is fixed rather than
-        derived from its score. This exists to support oracle-style
-        experiments that ask "what would SCRATCH-only / CLONE-only /
-        REUSE-only have done here?" as a reference for how well the
-        automatic, score-driven policy is doing (see
-        ``examples/skill_memory_policy_oracle.py``). It is not meant to be
-        used for the automatic policy itself.
-        """
-
+        """Select acquisition mode and initialize the active learner."""
         self.last_decision = self.SCRATCH
         self.last_selected_skill = None
         self.last_reused_skill = None
         self.last_compatibility_score = 0.0
+        self._saved_train_epochs = None
 
         if self.compatibility is None or len(self.memory) == 0:
             return
 
         if self.force_decision == self.SCRATCH:
-            # Still compute the score for logging/analysis, but never load a
-            # candidate into the active model.
             _, self.last_compatibility_score = self.memory.best_match(
                 strategy.experience, self.compatibility, threshold=0.0
             )
             return
 
-        # Query at the clone threshold (or 0.0 when a decision is forced) so
-        # a candidate in the clone range is still available for the policy
-        # decision.
         query_threshold = 0.0 if self.force_decision else self.clone_threshold
         record, score = self.memory.best_match(
-            strategy.experience,
-            self.compatibility,
-            threshold=query_threshold,
+            strategy.experience, self.compatibility, threshold=query_threshold
         )
         self.last_compatibility_score = score
         if record is None:
             return
 
         self.last_selected_skill = record.name
-        if self.force_decision is not None:
-            decision = self.force_decision
-        elif score >= self.reuse_threshold:
-            decision = self.REUSE
-        else:
-            decision = self.CLONE
+        decision = self.force_decision
+        if decision is None:
+            decision = self.REUSE if score >= self.reuse_threshold else self.CLONE
         self.last_decision = decision
         if decision == self.REUSE:
             self.last_reused_skill = record.name
 
-        # SkillMemory.load_into performs an independent copy, so subsequent
-        # training operates on the active model and cannot mutate the source.
+        # load_into is an independent state copy. Training the active model
+        # therefore cannot mutate the stored source record.
         self.memory.load_into(record.name, strategy.model)
 
-        if self.reset_optimizer_on_reuse and hasattr(strategy, "optimizer"):
-            strategy.optimizer.state.clear()
+        if decision == self.REUSE and not self.train_on_reuse:
+            # Direct REUSE means use the learned skill as-is. Temporarily
+            # suppress ordinary Avalanche training for this experience.
+            if hasattr(strategy, "train_epochs"):
+                self._saved_train_epochs = strategy.train_epochs
+                strategy.train_epochs = 0
+        elif decision == self.REUSE and self.reset_optimizer_on_reuse:
+            if hasattr(strategy, "optimizer"):
+                strategy.optimizer.state.clear()
 
     def after_training_exp(self, strategy, **kwargs):
-        """Register the newly acquired model state after every experience."""
+        """Restore settings and register only newly acquired skills."""
+        if self._saved_train_epochs is not None:
+            strategy.train_epochs = self._saved_train_epochs
+            self._saved_train_epochs = None
+
+        # REUSE references an existing immutable skill; it does not acquire a
+        # new version and must never replace the source record.
+        if self.last_decision == self.REUSE:
+            return
 
         experience = strategy.experience
         name = self.skill_name(experience)
