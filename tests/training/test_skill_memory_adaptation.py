@@ -1,3 +1,4 @@
+import pytest
 import torch
 from torch import nn
 
@@ -86,17 +87,12 @@ def test_adaptation_scorer_rejects_invalid_batch_size():
         batch_size=0,
     )
 
-    with torch.no_grad():
-        record_model = factory()
+    record_model = factory()
     memory = SkillMemory()
     memory.register("skill", record_model.state_dict())
 
-    try:
+    with pytest.raises(ValueError, match="batch_size"):
         scorer(memory.get("skill"), Experience())
-    except ValueError as exc:
-        assert "batch_size" in str(exc)
-    else:
-        raise AssertionError("expected invalid batch_size to raise ValueError")
 
 
 def test_automatic_policy_uses_adaptation_value_for_clone():
