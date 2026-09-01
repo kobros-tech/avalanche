@@ -1,23 +1,4 @@
-"""Controlled multi-seed benchmark for the Skill Memory Avalanche integration.
-
-The benchmark compares otherwise identical continual-learning runs:
-
-* ``baseline``: ordinary Naive training across four arithmetic tasks.
-* ``skill_memory``: the same training with automatic score-driven Skill Memory.
-
-The evaluation set is generated independently and is never passed to the
-compatibility decision.
-
-Compatibility is scored with :class:`ProbeCompatibilityScorer`: each
-candidate skill's zero-shot MSE on a small probe drawn from the new
-experience's own training distribution (a fresh sample, not the actual
-training minibatches or the eval set) is compared against a mean-predictor
-reference. This intentionally replaces an earlier binary "is this operation a
-declared prerequisite?" lookup, which could only ever return exactly 0.0 or
-1.0 and therefore could never land inside the CLONE band -- see
-``docs/skill_memory_benchmark.md`` ("Why probe-based compatibility") for the
-full rationale.
-"""
+"""Controlled multi-seed benchmark for the Skill Memory Avalanche integration."""
 
 from __future__ import annotations
 
@@ -33,6 +14,7 @@ from torch.utils.data import Dataset
 
 from avalanche.training import Naive
 from avalanche.training.skill_memory import (
+    AdaptationCompatibilityScorer,
     ProbeCompatibilityScorer,
     SkillMemory,
     SkillMemoryPlugin,
@@ -51,15 +33,11 @@ EPOCHS = 3
 TASKS = ["multiply", "add", "square", "divide"]
 FORGETTING_TASKS = TASKS[:-1]
 REUSE_THRESHOLD = 0.90
-CLONE_THRESHOLD = 0.30
+ADAPTATION_STEPS = 3
 
 
 def make_model() -> nn.Module:
-    return nn.Sequential(
-        nn.Linear(2, 16),
-        nn.ReLU(),
-        nn.Linear(16, 1),
-    )
+    return nn.Sequential(nn.Linear(2, 16), nn.ReLU(), nn.Linear(16, 1))
 
 
 @dataclass
@@ -100,7 +78,6 @@ def make_dataset(operation: str, n_samples: int, seed: int) -> ArithmeticDataset
     generator = torch.Generator().manual_seed(seed)
     x = torch.rand(n_samples, 2, generator=generator) * 4.0 + 1.0
     a, b = x[:, 0], x[:, 1]
-
     if operation == "multiply":
         y = a * b
     elif operation == "add":
@@ -111,7 +88,6 @@ def make_dataset(operation: str, n_samples: int, seed: int) -> ArithmeticDataset
         y = a / b
     else:
         raise ValueError(f"unknown operation: {operation}")
-
     return ArithmeticDataset((x, y.unsqueeze(1)))
 
 
@@ -120,43 +96,21 @@ def make_experience(index: int, operation: str, prerequisites: Tuple[str, ...], 
         current_experience=index,
         operation=operation,
         prerequisites=prerequisites,
-        dataset=make_dataset(
-            operation,
-            TRAIN_SAMPLES,
-            TRAIN_SEED_BASE + seed * len(TASKS) + index,
-        ),
+        dataset=make_dataset(operation, TRAIN_SAMPLES, TRAIN_SEED_BASE + seed * len(TASKS) + index),
         origin_stream=ArithmeticStream(name="arithmetic_train"),
     )
 
 
 def evaluate(model: nn.Module, operation: str, seed: int) -> float:
-    dataset = make_dataset(
-        operation,
-        EVAL_SAMPLES,
-        EVAL_SEED_BASE + seed * len(TASKS) + TASKS.index(operation),
-    )
+    dataset = make_dataset(operation, EVAL_SAMPLES, EVAL_SEED_BASE + seed * len(TASKS) + TASKS.index(operation))
     model.eval()
     with torch.no_grad():
-        predictions = model(dataset.tensors[0])
-        return float(nn.functional.mse_loss(predictions, dataset.tensors[1]))
+        return float(nn.functional.mse_loss(model(dataset.tensors[0]), dataset.tensors[1]))
 
 
 def probe_batch(experience: ArithmeticExperience, seed: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    """A small, freshly sampled probe from the new experience's own task.
-
-    Uses the same operation and a seed derived from the run seed, but a
-    disjoint sample range from both the actual training minibatches and the
-    evaluation set (``PROBE_SEED_BASE`` vs ``TRAIN_SEED_BASE``/
-    ``EVAL_SEED_BASE``). This is legitimate at decision time: the plugin is
-    told the new experience's operation before training on it (that is the
-    whole premise of "should I reuse/clone/scratch for this task?"), it just
-    must not see the held-out evaluation samples.
-    """
-    dataset = make_dataset(
-        experience.operation,
-        PROBE_SAMPLES,
-        PROBE_SEED_BASE + seed * len(TASKS) + experience.current_experience,
-    )
+    dataset = make_dataset(operation=experience.operation, n_samples=PROBE_SAMPLES,
+                           seed=PROBE_SEED_BASE + seed * len(TASKS) + experience.current_experience)
     return dataset.tensors
 
 
@@ -170,26 +124,30 @@ def build_strategy(use_skill_memory: bool, seed: int, force_decision: str = None
     if use_skill_memory:
         memory = SkillMemory(max_skills=8)
 
-        def metadata(exp: ArithmeticExperience):
-            return {
-                "operation": exp.operation,
-                "prerequisites": list(exp.prerequisites),
-            }
-
         compatibility = ProbeCompatibilityScorer(
             model_factory=make_model,
             loss_fn=nn.functional.mse_loss,
             probe_fn=lambda exp: probe_batch(exp, seed),
             reference_fn=lambda exp: mean_baseline_mse(probe_batch(exp, seed)[1]),
         )
+        clone_compatibility = AdaptationCompatibilityScorer(
+            model_factory=make_model,
+            loss_fn=nn.functional.mse_loss,
+            probe_fn=lambda exp: probe_batch(exp, seed),
+            steps=ADAPTATION_STEPS,
+            optimizer_factory=lambda parameters: torch.optim.Adam(parameters, lr=1e-2),
+        )
 
         skill_plugin = SkillMemoryPlugin(
             memory=memory,
             skill_name=lambda exp: exp.operation,
-            skill_metadata=metadata,
+            skill_metadata=lambda exp: {
+                "operation": exp.operation,
+                "prerequisites": list(exp.prerequisites),
+            },
             compatibility=compatibility,
+            clone_compatibility=clone_compatibility,
             reuse_threshold=REUSE_THRESHOLD,
-            clone_threshold=CLONE_THRESHOLD,
             force_decision=force_decision,
         )
         plugins.append(skill_plugin)
@@ -210,43 +168,30 @@ def build_strategy(use_skill_memory: bool, seed: int, force_decision: str = None
 def run_condition(use_skill_memory: bool, seed: int, force_decision: str = None) -> Dict:
     torch.manual_seed(seed)
     strategy, memory, plugin = build_strategy(use_skill_memory, seed, force_decision=force_decision)
-
     experiences = [
         make_experience(0, "multiply", (), seed),
         make_experience(1, "add", (), seed),
         make_experience(2, "square", ("multiply",), seed),
         make_experience(3, "divide", (), seed),
     ]
-
     mse_history: List[Dict[str, float]] = []
     decisions: List[Dict[str, object]] = []
 
     for experience in experiences:
         strategy.train(experience, eval_streams=[])
-
-        if plugin is None:
-            decision = "baseline"
-            score = None
-        else:
-            decision = plugin.last_decision
-            if plugin.last_selected_skill is not None:
-                decision = f"{decision}:{plugin.last_selected_skill}"
-            score = plugin.last_compatibility_score
-
-        decisions.append(
-            {
-                "operation": experience.operation,
-                "decision": decision,
-                "compatibility_score": score,
-            }
-        )
-
-        current = {
+        decision = "baseline" if plugin is None else plugin.last_decision
+        if plugin is not None and plugin.last_selected_skill is not None:
+            decision = f"{decision}:{plugin.last_selected_skill}"
+        decisions.append({
+            "operation": experience.operation,
+            "decision": decision,
+            "compatibility_score": None if plugin is None else plugin.last_compatibility_score,
+            "clone_value": None if plugin is None else plugin.last_clone_value,
+        })
+        mse_history.append({
             operation: evaluate(strategy.model, operation, seed)
-            for index, operation in enumerate(TASKS)
-            if index <= experience.current_experience
-        }
-        mse_history.append(current)
+            for index, operation in enumerate(TASKS) if index <= experience.current_experience
+        })
 
     final_mse = mse_history[-1]
     forgetting = {}
@@ -258,8 +203,7 @@ def run_condition(use_skill_memory: bool, seed: int, force_decision: str = None)
         "condition": "skill_memory" if use_skill_memory else "baseline",
         "seed": seed,
         "epochs_per_experience": EPOCHS,
-        "train_samples_per_experience": TRAIN_SAMPLES,
-        "eval_samples_per_task": EVAL_SAMPLES,
+        "adaptation_steps_for_clone_decision": ADAPTATION_STEPS,
         "mse_history": mse_history,
         "final_mse": final_mse,
         "forgetting_mse": forgetting,
@@ -289,53 +233,48 @@ def summarize(runs: List[Dict]) -> Dict:
     summary = {}
     for task in TASKS:
         values = [run["final_mse"][task] for run in runs]
-        summary[task] = {
-            "mean": mean(values),
-            "std": std(values),
-            "ci95": ci95(values),
-        }
-
+        summary[task] = {"mean": mean(values), "std": std(values), "ci95": ci95(values)}
     summary["forgetting_mse"] = {}
     for task in FORGETTING_TASKS:
         values = [run["forgetting_mse"][task] for run in runs]
-        summary["forgetting_mse"][task] = {
-            "mean": mean(values),
-            "std": std(values),
-            "ci95": ci95(values),
-        }
-
+        summary["forgetting_mse"][task] = {"mean": mean(values), "std": std(values), "ci95": ci95(values)}
     return summary
 
 
-def paired_metric_summary(
-    baseline_runs: List[Dict], skill_memory_runs: List[Dict], metric: str
-) -> Dict:
-    """Summarize paired Skill Memory minus baseline differences by task."""
+def paired_metric_summary(baseline_runs: List[Dict], skill_memory_runs: List[Dict], metric: str) -> Dict:
     tasks = TASKS if metric == "final_mse" else FORGETTING_TASKS
     result = {}
     for task in tasks:
-        if metric == "final_mse":
-            baseline_values = [run["final_mse"][task] for run in baseline_runs]
-            skill_values = [run["final_mse"][task] for run in skill_memory_runs]
-        elif metric == "forgetting_mse":
-            baseline_values = [run["forgetting_mse"][task] for run in baseline_runs]
-            skill_values = [run["forgetting_mse"][task] for run in skill_memory_runs]
-        else:
-            raise ValueError(f"unknown metric: {metric}")
-
+        baseline_values = [run[metric][task] for run in baseline_runs]
+        skill_values = [run[metric][task] for run in skill_memory_runs]
         differences = [skill - baseline for skill, baseline in zip(skill_values, baseline_values)]
         wins = sum(difference < 0.0 for difference in differences)
         losses = sum(difference > 0.0 for difference in differences)
-        ties = len(differences) - wins - losses
         result[task] = {
             "skill_memory_minus_baseline_mean": mean(differences),
             "skill_memory_minus_baseline_std": std(differences),
             "ci95": ci95(differences),
             "skill_memory_wins": wins,
             "baseline_wins": losses,
-            "ties": ties,
+            "ties": len(differences) - wins - losses,
             "n": len(differences),
         }
+    return result
+
+
+def oracle_agreement(skill_memory_runs: List[Dict], oracle_runs: Dict[str, List[Dict]]) -> Dict:
+    result = {}
+    for task_index, task in enumerate(TASKS):
+        policy = [run["decisions"][task_index]["decision"].split(":")[0] for run in skill_memory_runs]
+        oracle_choices = []
+        for seed_index in range(len(SEEDS)):
+            candidates = {
+                condition: oracle_runs[condition][seed_index]["final_mse"][task]
+                for condition in ("reuse", "clone", "scratch")
+            }
+            oracle_choices.append(min(candidates, key=candidates.get))
+        matches = sum(a == b for a, b in zip(policy, oracle_choices))
+        result[task] = {"matches": matches, "n": len(SEEDS), "agreement": matches / len(SEEDS)}
     return result
 
 
@@ -343,72 +282,55 @@ def main() -> None:
     results = []
     for seed in SEEDS:
         print(f"Running seed {seed}...")
-        baseline = run_condition(False, seed)
-        skill_memory = run_condition(True, seed)
-        results.append({"seed": seed, "baseline": baseline, "skill_memory": skill_memory})
+        results.append({
+            "seed": seed,
+            "baseline": run_condition(False, seed),
+            "skill_memory": run_condition(True, seed),
+            "reuse": run_condition(True, seed, force_decision=SkillMemoryPlugin.REUSE),
+            "clone": run_condition(True, seed, force_decision=SkillMemoryPlugin.CLONE),
+            "scratch": run_condition(True, seed, force_decision=SkillMemoryPlugin.SCRATCH),
+        })
 
     baseline_runs = [item["baseline"] for item in results]
-    skill_memory_runs = [item["skill_memory"] for item in results]
+    skill_runs = [item["skill_memory"] for item in results]
+    oracle_runs = {condition: [item[condition] for item in results] for condition in ("reuse", "clone", "scratch")}
 
     result = {
-        "benchmark": "skill_memory_arithmetic_multiseed_v4",
-        "description": (
-            "15-seed controlled baseline vs automatic score-driven Skill Memory "
-            "benchmark, using ProbeCompatibilityScorer (continuous, zero-shot-"
-            "probe-based compatibility) instead of a binary prerequisite lookup."
-        ),
+        "benchmark": "skill_memory_arithmetic_multiseed_v5_adaptation_policy",
+        "description": "15-seed baseline plus oracle control benchmark using zero-shot evidence for REUSE and matched-budget adaptation value for CLONE.",
         "policy": {
             "reuse_threshold": REUSE_THRESHOLD,
-            "clone_threshold": CLONE_THRESHOLD,
-            "compatibility": "ProbeCompatibilityScorer (zero-shot MSE vs mean-baseline reference)",
+            "clone_threshold": None,
+            "clone_rule": "select the stored candidate with the greatest positive post-adaptation improvement over a fresh model; otherwise SCRATCH",
+            "adaptation_steps": ADAPTATION_STEPS,
+            "probe": "fresh samples from the new experience training distribution; never the evaluation stream",
         },
         "seeds": SEEDS,
-        "metric_definitions": {
-            "final_mse": "MSE on an independent evaluation set after the final experience.",
-            "forgetting_mse": "max(0, final MSE - minimum MSE observed after any experience for that task).",
-            "paired_difference": "Skill Memory metric minus baseline metric for the same seed.",
-            "confidence_interval": "Approximate 95% CI using mean +/- 1.96 * sample SD / sqrt(n).",
-            "forgetting_scope": "Only previously encountered tasks; divide is excluded because there is no later experience after it to measure forgetting.",
-        },
         "conditions": {
             "baseline": {"runs": baseline_runs, "summary": summarize(baseline_runs)},
-            "skill_memory": {"runs": skill_memory_runs, "summary": summarize(skill_memory_runs)},
+            "skill_memory": {"runs": skill_runs, "summary": summarize(skill_runs)},
+            "oracle_reuse": {"summary": summarize(oracle_runs["reuse"])},
+            "oracle_clone": {"summary": summarize(oracle_runs["clone"])},
+            "oracle_scratch": {"summary": summarize(oracle_runs["scratch"])},
         },
         "paired_comparison": {
-            "final_mse": paired_metric_summary(baseline_runs, skill_memory_runs, "final_mse"),
-            "forgetting_mse": paired_metric_summary(baseline_runs, skill_memory_runs, "forgetting_mse"),
+            "final_mse": paired_metric_summary(baseline_runs, skill_runs, "final_mse"),
+            "forgetting_mse": paired_metric_summary(baseline_runs, skill_runs, "forgetting_mse"),
         },
+        "policy_oracle_agreement": oracle_agreement(skill_runs, oracle_runs),
     }
 
     output_path = Path("results/skill_memory_benchmark_multiseed.json")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
 
-    for condition_name in ("baseline", "skill_memory"):
-        print(f"\n[{condition_name}]")
-        print(json.dumps(result["conditions"][condition_name]["summary"], indent=2))
-
-    print("\n[paired final MSE]")
-    print(json.dumps(result["paired_comparison"]["final_mse"], indent=2))
-    print("\n[paired forgetting MSE]")
-    print(json.dumps(result["paired_comparison"]["forgetting_mse"], indent=2))
-
-    for run in skill_memory_runs:
-        decisions = [item["decision"] for item in run["decisions"]]
-        # The first experience always starts from an empty memory, so it must
-        # be SCRATCH. Beyond that, decisions vary by seed now that the score
-        # is a real probe measurement rather than a fixed binary lookup -- see
-        # docs/skill_memory_benchmark.md for what this run actually found.
-        assert decisions[0] == "scratch"
-        for decision in decisions:
-            assert (
-                decision == "scratch"
-                or decision.startswith("clone:")
-                or decision.startswith("reuse:")
-            )
+    for run in skill_runs:
+        assert run["decisions"][0]["decision"] == "scratch"
         assert run["stored_skills"] == TASKS
 
-    print(f"\nResults written to {output_path}")
+    print(json.dumps(result["paired_comparison"], indent=2))
+    print(json.dumps(result["policy_oracle_agreement"], indent=2))
+    print(f"Results written to {output_path}")
 
 
 if __name__ == "__main__":
