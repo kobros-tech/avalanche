@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Tuple
+from typing import Any, Callable, Optional, Tuple
 
 import torch
 from torch import Tensor, nn
@@ -38,20 +38,28 @@ class ProbeCompatibilityScorer:
 class AdaptationCompatibilityScorer:
     """Measure transfer value against a fair, matched SCRATCH control.
 
-    Candidate and SCRATCH models receive the same probe, optimizer and number
-    of gradient updates. The SCRATCH model is initialized from the exact same
-    RNG state as the candidate's factory call, eliminating initialization noise
-    from the comparison. The adaptation budget should match the number of
-    optimizer updates available during the corresponding training experience.
+    Candidate and SCRATCH models receive the same adaptation data, optimizer,
+    minibatch ordering, and number of optimizer updates. When ``batch_size``
+    is omitted, the scorer retains the original single-batch behavior for
+    backwards-compatible unit tests and small probes.
 
-    The probe must come only from the new experience's training distribution;
-    it must never be the final evaluation stream.
+    With ``batch_size`` set, the returned adaptation loss is measured after the
+    exact requested number of updates. Batches are consumed in deterministic
+    order and the sequence wraps to the beginning when more updates than one
+    pass over the adaptation data are requested. This makes it possible to
+    match an Avalanche learner's minibatch training procedure exactly, e.g.
+    64 samples / batch size 16 / 12 updates = 3 complete epochs.
+
+    The adaptation data must come only from the new experience's training
+    distribution; it must never be the final evaluation stream.
     """
 
     model_factory: Callable[[], nn.Module]
     loss_fn: Callable[[Tensor, Tensor], Tensor]
     probe_fn: Callable[[Any], Tuple[Tensor, Tensor]]
     steps: int = 3
+    batch_size: Optional[int] = None
+    adaptation_fn: Optional[Callable[[Any], Tuple[Tensor, Tensor]]] = None
     optimizer_factory: Callable[[Any], torch.optim.Optimizer] = (
         lambda parameters: torch.optim.SGD(parameters, lr=1e-2)
     )
@@ -60,11 +68,34 @@ class AdaptationCompatibilityScorer:
     def _adapt(self, model: nn.Module, x: Tensor, y: Tensor) -> float:
         optimizer = self.optimizer_factory(model.parameters())
         model.train()
-        for _ in range(self.steps):
-            optimizer.zero_grad()
-            loss = self.loss_fn(model(x), y)
-            loss.backward()
-            optimizer.step()
+
+        if self.batch_size is None:
+            for _ in range(self.steps):
+                optimizer.zero_grad()
+                loss = self.loss_fn(model(x), y)
+                loss.backward()
+                optimizer.step()
+        else:
+            if self.batch_size <= 0:
+                raise ValueError("batch_size must be positive")
+            if len(x) == 0:
+                raise ValueError("adaptation data must not be empty")
+            if len(x) != len(y):
+                raise ValueError("adaptation inputs and targets must have equal length")
+
+            num_batches = (len(x) + self.batch_size - 1) // self.batch_size
+            for update in range(self.steps):
+                batch_index = update % num_batches
+                start = batch_index * self.batch_size
+                end = min(start + self.batch_size, len(x))
+                batch_x = x[start:end]
+                batch_y = y[start:end]
+
+                optimizer.zero_grad()
+                loss = self.loss_fn(model(batch_x), batch_y)
+                loss.backward()
+                optimizer.step()
+
         model.eval()
         with torch.no_grad():
             return float(self.loss_fn(model(x), y))
@@ -72,16 +103,19 @@ class AdaptationCompatibilityScorer:
     def __call__(self, record: SkillRecord, query: Any) -> float:
         if self.steps < 0:
             raise ValueError("steps must be non-negative")
-        x, y = self.probe_fn(query)
+        if self.batch_size is not None and self.batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+
+        data_fn = self.adaptation_fn or self.probe_fn
+        x, y = data_fn(query)
 
         rng_state = torch.random.get_rng_state()
         candidate = self.model_factory()
         candidate.load_state_dict(record.state_dict)
         candidate_loss = self._adapt(candidate, x, y)
 
-        # Use the exact same fresh initialization that would have been used
-        # immediately before candidate construction. This makes the control
-        # comparison about the stored initialization, not random luck.
+        # Recreate the exact same fresh initialization for SCRATCH so the
+        # comparison isolates initialization quality from random luck.
         torch.random.set_rng_state(rng_state)
         scratch = self.model_factory()
         scratch_loss = self._adapt(scratch, x, y)
