@@ -33,7 +33,9 @@ EPOCHS = 3
 TASKS = ["multiply", "add", "square", "divide"]
 FORGETTING_TASKS = TASKS[:-1]
 REUSE_THRESHOLD = 0.90
-ADAPTATION_STEPS = 3
+# Keep the adaptation probe budget matched to the actual training experience:
+# 3 epochs * 4 minibatches per epoch (64 samples / batch size 16) = 12 updates.
+ADAPTATION_STEPS = 12
 
 
 def make_model() -> nn.Module:
