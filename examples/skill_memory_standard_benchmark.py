@@ -35,9 +35,9 @@ seen experiences, reuse/acquisition decisions, compatibility scores, and
 training time.
 
 Cost control: this benchmark trains on real MNIST images and was previously
-removed from CI for being too expensive. Set the ``FAST_TEST=True``
-environment variable (already used elsewhere in this repo's CI) to subsample
-each experience's train/test data to ``FAST_TRAIN_SAMPLES`` /
+removed from CI for being too expensive. Set the ``FAST_TEST=True`` environment
+variable (already used elsewhere in this repo's CI) to subsample each
+experience's train/test data to ``FAST_TRAIN_SAMPLES`` /
 ``FAST_EVAL_SAMPLES`` images and run a single seed; this keeps the benchmark
 fast enough for CI while still exercising the real code path end to end.
 Without ``FAST_TEST`` it runs the full dataset across ``SEEDS`` for a
@@ -72,8 +72,6 @@ from avalanche.training.skill_memory import (
 FAST_TEST = os.environ.get("FAST_TEST", "").lower() == "true"
 
 SEEDS = [0] if FAST_TEST else [0, 1, 2]
-# A small, separate slice of seeds that also run the forced-decision oracle
-# conditions. Kept short because it triples the skill-memory cost.
 ORACLE_SEEDS = [0] if FAST_TEST else [0, 1]
 
 ROTATIONS = [0, 30, 60, 0, 30]
@@ -87,10 +85,6 @@ REUSE_THRESHOLD = 0.90
 CLONE_THRESHOLD = 0.30
 PROBE_SAMPLES = 64
 
-# Real MNIST has 60k/10k train/test images spread across 5 experiences; that
-# is what made this benchmark expensive in CI. FAST_TEST subsamples each
-# experience down to a small fixed size so the same code path still runs
-# against real data, just less of it.
 FAST_TRAIN_SAMPLES = 200
 FAST_EVAL_SAMPLES = 200
 
@@ -100,12 +94,7 @@ def make_model() -> nn.Module:
 
 
 class _SubsampledExperience:
-    """Wraps an Avalanche experience, replacing ``dataset`` with a subset.
-
-    Everything else (``current_experience``, ``origin_stream``, task labels,
-    etc.) is forwarded to the original experience unchanged, so this is a
-    drop-in substitute anywhere an experience is expected.
-    """
+    """Wraps an Avalanche experience, replacing ``dataset`` with a subset."""
 
     def __init__(self, experience, dataset):
         self.dataset = dataset
@@ -147,12 +136,7 @@ def accuracy(model: nn.Module, experience) -> float:
 
 
 def probe_batch(experience, seed: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    """A small probe drawn from the new experience's own *training* images.
-
-    Independent from the actual training minibatches (a fresh random subset,
-    seeded separately) and, crucially, independent from the evaluation/test
-    stream, which this function never touches.
-    """
+    """Draw a small probe only from the new experience's training images."""
     probed = subsample(experience, PROBE_SAMPLES, seed=seed + 900_000)
     loader = DataLoader(probed.dataset, batch_size=len(probed.dataset), shuffle=False)
     x, y, *_ = next(iter(loader))
@@ -375,13 +359,7 @@ def main() -> None:
 
     for run in conditions["skill_memory"]["runs"]:
         decisions = [item["decision"] for item in run["decisions"]]
-        # The first three experiences (rotations 0, 30, 60) are all new, so
-        # memory is either empty or holds only unrelated rotations -- SCRATCH
-        # is the only reachable decision there. Experiences 3 and 4 repeat an
-        # earlier rotation exactly, so their best candidate's probe score
-        # should be very high; whether that is enough to clear REUSE_THRESHOLD
-        # (vs. landing in CLONE) is itself part of what this benchmark reports,
-        # so it is not hard-asserted here -- see the written JSON results.
+        # The first three experiences are new, so they must acquire skills.
         assert decisions[0] == "scratch"
         assert decisions[1] == "scratch"
         assert decisions[2] == "scratch"
@@ -391,9 +369,15 @@ def main() -> None:
                 or decision.startswith("clone:")
                 or decision.startswith("reuse:")
             )
-        assert run["stored_skills"] == [
-            f"rotation_{ROTATIONS[i]}_exp_{i}" for i in range(len(ROTATIONS))
+
+        # REUSE is not an acquisition: only experiences whose decision creates
+        # a new skill should appear in the registry.
+        expected_stored = [
+            f"rotation_{ROTATIONS[i]}_exp_{i}"
+            for i, decision in enumerate(decisions)
+            if decision == "scratch" or decision.startswith("clone:")
         ]
+        assert run["stored_skills"] == expected_stored
 
     print(json.dumps({k: v["summary"] for k, v in conditions.items()}, indent=2))
     print(f"Results written to {output_path}")
