@@ -175,10 +175,8 @@ def main() -> None:
     assert decisions["add"] == "acquire"
     assert decisions["square"] == "reuse:multiply"
     assert decisions["divide"] == "acquire"
-    assert memory.contains("multiply")
-    assert memory.contains("add")
-    assert memory.contains("square")
-    assert memory.contains("divide")
+    assert memory.names() == ["multiply", "add", "divide"]
+    assert not memory.contains("square")
 
     print(f"stored_skills={memory.names()}")
     print("Arithmetic Skill Memory PoC completed successfully.")
