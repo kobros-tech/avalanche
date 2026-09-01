@@ -23,27 +23,17 @@ class SkillMemoryPlugin(SupervisedPlugin):
     CLONE = "clone"
     SCRATCH = "scratch"
 
-    def __init__(
-        self,
-        memory: Optional[SkillMemory] = None,
-        *,
-        skill_name: Callable[[Any], str] = lambda exp: str(exp.current_experience),
-        compatibility: Optional[Callable[[SkillRecord, Any], float]] = None,
-        clone_compatibility: Optional[Callable[[SkillRecord, Any], float]] = None,
-        skill_metadata: Optional[Callable[[Any], Mapping[str, Any]]] = None,
-        reuse_threshold: float = 0.90,
-        clone_threshold: float = 0.30,
-        threshold: Optional[float] = None,
-        replace_existing: bool = False,
-        force_decision: Optional[str] = None,
-    ):
+    def __init__(self, memory: Optional[SkillMemory] = None, *,
+                 skill_name: Callable[[Any], str] = lambda exp: str(exp.current_experience),
+                 compatibility: Optional[Callable[[SkillRecord, Any], float]] = None,
+                 clone_compatibility: Optional[Callable[[SkillRecord, Any], float]] = None,
+                 skill_metadata: Optional[Callable[[Any], Mapping[str, Any]]] = None,
+                 reuse_threshold: float = 0.90, clone_threshold: float = 0.30,
+                 threshold: Optional[float] = None, replace_existing: bool = False,
+                 force_decision: Optional[str] = None):
         super().__init__()
-        if force_decision is not None and force_decision not in (
-            self.REUSE, self.CLONE, self.SCRATCH
-        ):
-            raise ValueError(
-                "force_decision must be one of 'reuse', 'clone', 'scratch', or None"
-            )
+        if force_decision is not None and force_decision not in (self.REUSE, self.CLONE, self.SCRATCH):
+            raise ValueError("force_decision must be one of 'reuse', 'clone', 'scratch', or None")
         if threshold is not None:
             clone_threshold = threshold
         if not 0.0 <= clone_threshold <= 1.0:
@@ -63,17 +53,16 @@ class SkillMemoryPlugin(SupervisedPlugin):
         self.replace_existing = replace_existing
         self.force_decision = force_decision
 
-        self.last_decision: str = self.SCRATCH
+        self.last_decision = self.SCRATCH
         self.last_selected_skill: Optional[str] = None
         self.last_reused_skill: Optional[str] = None
-        self.last_compatibility_score: float = 0.0
-        self.last_clone_value: float = 0.0
+        self.last_compatibility_score = 0.0
+        self.last_clone_value = 0.0
         self._saved_train_epochs: Optional[int] = None
         self._initial_model_state: Optional[dict[str, Any]] = None
 
     @staticmethod
     def _reset_optimizer(strategy) -> None:
-        """Start a newly acquired skill with fresh optimizer state."""
         optimizer = getattr(strategy, "optimizer", None)
         if optimizer is not None:
             optimizer.state.clear()
@@ -95,7 +84,6 @@ class SkillMemoryPlugin(SupervisedPlugin):
         self._reset_optimizer(strategy)
 
     def before_training_exp(self, strategy, **kwargs):
-        """Select acquisition mode and initialize the active learner."""
         self._capture_initial_model_state(strategy)
         self.last_decision = self.SCRATCH
         self.last_selected_skill = None
@@ -108,8 +96,6 @@ class SkillMemoryPlugin(SupervisedPlugin):
             self._scratch(strategy)
             return
 
-        # REUSE requires a zero-shot compatibility estimator. If none is
-        # supplied, automatic policy cannot safely select REUSE.
         reuse_record = None
         reuse_score = 0.0
         if self.compatibility is not None:
@@ -144,7 +130,10 @@ class SkillMemoryPlugin(SupervisedPlugin):
                 strategy.experience, scorer, threshold=0.0
             )
             self.last_clone_value = value
-            if record is None or value <= 0.0:
+            # Forced CLONE is an oracle/control condition: if a candidate exists,
+            # clone it regardless of its score. The automatic policy below is
+            # the place where positive evidence is required.
+            if record is None:
                 self._scratch(strategy)
                 return
             self.last_selected_skill = record.name
@@ -153,11 +142,6 @@ class SkillMemoryPlugin(SupervisedPlugin):
             self._reset_optimizer(strategy)
             return
 
-        # Automatic policy: REUSE is considered only when the stored skill
-        # already solves the task strongly. Otherwise evaluate each candidate
-        # by matched-budget adaptation value. Positive improvement over fresh
-        # initialization is the evidence required to CLONE. If no candidate
-        # beats scratch, SCRATCH is selected.
         if reuse_record is not None and reuse_score >= self.reuse_threshold:
             self.last_selected_skill = reuse_record.name
             self.last_reused_skill = reuse_record.name
@@ -180,8 +164,6 @@ class SkillMemoryPlugin(SupervisedPlugin):
                 self._reset_optimizer(strategy)
                 return
         elif reuse_record is not None and reuse_score >= self.clone_threshold:
-            # Backward-compatible threshold policy for callers that have not
-            # provided an adaptation-aware scorer yet.
             self.last_selected_skill = reuse_record.name
             self.last_decision = self.CLONE
             self.memory.load_into(reuse_record.name, strategy.model)
@@ -191,7 +173,6 @@ class SkillMemoryPlugin(SupervisedPlugin):
         self._scratch(strategy)
 
     def after_training_exp(self, strategy, **kwargs):
-        """Restore settings and register only newly acquired skills."""
         if self._saved_train_epochs is not None:
             strategy.train_epochs = self._saved_train_epochs
             self._saved_train_epochs = None
@@ -202,22 +183,16 @@ class SkillMemoryPlugin(SupervisedPlugin):
         experience = strategy.experience
         name = self.skill_name(experience)
         metadata = dict(self.skill_metadata(experience)) if self.skill_metadata else {}
-        metadata.update(
-            {
-                "acquisition_decision": self.last_decision,
-                "selected_skill": self.last_selected_skill,
-                "reused_from": self.last_reused_skill,
-                "compatibility_score": self.last_compatibility_score,
-                "clone_value": self.last_clone_value,
-            }
-        )
+        metadata.update({
+            "acquisition_decision": self.last_decision,
+            "selected_skill": self.last_selected_skill,
+            "reused_from": self.last_reused_skill,
+            "compatibility_score": self.last_compatibility_score,
+            "clone_value": self.last_clone_value,
+        })
 
         if self.memory.contains(name) and not self.replace_existing:
             return
 
-        self.memory.register(
-            name,
-            strategy.model.state_dict(),
-            metadata=metadata,
-            replace=self.replace_existing,
-        )
+        self.memory.register(name, strategy.model.state_dict(), metadata=metadata,
+                              replace=self.replace_existing)
