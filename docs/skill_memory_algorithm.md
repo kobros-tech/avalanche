@@ -2,9 +2,11 @@
 
 ## Status
 
-This document is the normative definition of the Skill Memory algorithm investigated in this branch. It takes precedence over prototype wording that treats REUSE and CLONE as equivalent model initialization operations.
+This document is the normative definition of the Skill Memory algorithm investigated in this branch.
 
-**The algorithm does not prescribe fixed compatibility-score values or fixed score thresholds.** The compatibility score is evidence used to identify promising prior skills. The acquisition decision is made by comparing the expected outcomes of REUSE, CLONE, and SCRATCH, with SCRATCH as the fallback/reference. Score calibration and outcome estimation are experimental components and must be evaluated separately from the underlying skill-memory mechanism.
+The algorithm is **model-agnostic at the registry level**. A learned skill is represented by an independently stored model state and its metadata. The generic algorithm does **not** require a single neural network to be partitioned into neuron regions or reserved parameter blocks.
+
+The compatibility score is evidence used to identify promising prior skills. The acquisition decision is made by comparing the expected outcomes of REUSE, CLONE, and SCRATCH, with SCRATCH as the fallback/reference. Score calibration and outcome estimation are experimental components and must be evaluated separately from the underlying skill-memory mechanism.
 
 ## 1. Objective
 
@@ -14,37 +16,65 @@ The central invariant is:
 
 > **A learned skill is never modified by training for a later skill.**
 
-A skill may be **reused** without modification, or **cloned** into a new reserved region and the clone may then be modified by training. These are different operations.
+A skill may be **reused** without modification, or **cloned** into a new independent skill instance that may then be modified by training.
 
-Skill Memory is not defined as replay, and it is not merely a checkpoint registry.
+Skill Memory is not defined as replay, and it is not merely a checkpoint registry: the stored states are the persistent representations of acquired skills used by the acquisition policy.
 
 ## 2. Terminology
 
-### Skill
+### Skill instance
 
-A learned capability represented by a model parameter/neuron region (a reserved skill slot) together with the metadata needed to identify and score it.
+A learned capability represented by an independently stored model state together with the metadata needed to identify, evaluate, and trace it.
 
-### Reserved skill slot
+A skill instance is independent of other stored skill instances. Training a newly acquired skill must not modify the stored state of its source skill or any other previously acquired skill.
 
-A region of model parameters/neuron capacity assigned to exactly one acquired skill. Once a slot has been committed to a learned skill, its parameters are protected from subsequent training.
+The generic Skill Memory layer does not assume how many parameters a model has or how those parameters are internally organized.
 
-Slots are allocated in deterministic order: slot 0, slot 1, slot 2, and so on. The algorithm therefore grows the collection of acquired skills through successive reserved regions rather than rewriting an earlier skill.
+### Skill capacity
+
+`max_skills` is the maximum number of independently stored skill instances that the memory can contain.
+
+Capacity therefore counts **stored skill instances**, not neurons or parameter regions inside one shared network.
+
+For example:
+
+```text
+SkillMemory(max_skills=8)
+
+skill_0 = independent model state
+skill_1 = independent model state
+skill_2 = independent model state
+...
+skill_7 = independent model state
+```
+
+The size of an individual skill is determined by the model architecture used by the experiment. The generic registry does not prescribe a fixed parameter count or slot width.
+
+A model-specific implementation may choose to partition a shared model into parameter regions, but that is an optional architecture/adapter decision and is **not part of the generic Skill Memory contract**.
 
 ### REUSE
 
-Use an existing skill directly for the current experience. The selected skill's reserved parameters remain frozen. No gradient update is applied to that skill and no replacement copy is created.
+Use an existing skill directly for the current experience.
+
+The selected skill's stored state remains unchanged. No gradient update is applied to it and no new acquired skill record is created.
 
 REUSE is a **use operation, not an acquisition operation**.
 
 ### CLONE
 
-Copy the selected source skill from its reserved slot into the next unused reserved slot. The destination slot becomes the active skill for the new experience. Training is allowed to modify only the destination slot (and any explicitly designated shared parameters, if the model architecture declares them). The source slot remains unchanged.
+Create an independent copy of the selected source skill's model state. The copied state becomes the starting point for the new experience and may then be modified by training.
+
+The source skill remains unchanged. The clone receives its own independent optimizer/training state before adaptation.
+
+After successful acquisition, the trained copy is stored as a new skill instance with its own identity and lineage metadata.
 
 CLONE is an **acquisition operation**.
 
 ### SCRATCH
 
-Allocate the next unused reserved slot and initialize it from the normal fresh initialization. Train the new skill in that slot.
+Create a new independent model state using the normal fresh initialization. Train it on the new experience.
+
+After successful acquisition, store the resulting state as a new skill instance.
 
 SCRATCH is an **acquisition operation** and the reference/fallback whenever neither REUSE nor CLONE is expected to provide an advantage.
 
@@ -52,20 +82,19 @@ SCRATCH is an **acquisition operation** and the reference/fallback whenever neit
 
 For experiences `E_1, E_2, ..., E_T`:
 
-1. Start with an empty Skill Memory and the first unused reserved slot.
+1. Start with an empty Skill Memory.
 2. Receive the next experience through the normal Avalanche experience lifecycle.
 3. For each stored skill, compute a compatibility score using only information permitted for training-time decision making. Never use held-out final evaluation/test labels.
-4. Use the scores to identify the most promising prior skill candidates. If no stored skill is sufficiently promising according to the predefined candidate-selection procedure, select SCRATCH directly.
+4. Use the scores to identify the most promising prior skill candidates. If no stored skill is sufficiently promising according to the predefined candidate-selection procedure, SCRATCH may be selected directly.
 5. For each candidate retained for consideration, estimate the outcome of the available actions:
    - **REUSE:** use the candidate unchanged and estimate whether it already satisfies the target criterion;
-   - **CLONE:** copy the candidate into a new slot and estimate the learning outcome after adaptation under the same acquisition budget;
-   - **SCRATCH:** use a fresh slot and estimate the learning outcome under the same acquisition budget.
+   - **CLONE:** copy the candidate into a new independent model state and estimate the learning outcome after adaptation under the same acquisition budget;
+   - **SCRATCH:** use a freshly initialized independent model state and estimate the learning outcome under the same acquisition budget.
 6. Select the **best expected action** among REUSE, CLONE, and SCRATCH. The comparison must use the same predefined objective and budget for all alternatives.
-7. If **REUSE** is selected, activate the selected existing skill and keep its reserved parameters frozen. Do not train it and do not create a new skill record.
-8. If **CLONE** is selected, copy the selected source slot into the next unused slot, activate the destination slot, and train only the destination. The source remains protected.
-9. If **SCRATCH** is selected, initialize the next unused slot normally and train it.
-10. After a successful CLONE or SCRATCH acquisition, register the destination slot as a new skill in memory.
-11. Continue to the next experience.
+7. If **REUSE** is selected, activate/use the selected existing skill without training and without creating a new skill instance.
+8. If **CLONE** is selected, create an independent copy of the selected source state, reset the clone's optimizer/training state, train the copy, and store it as a new skill instance. The source remains protected.
+9. If **SCRATCH** is selected, initialize a fresh independent model state, train it, and store it as a new skill instance.
+10. Continue to the next experience.
 
 ### Core decision rule
 
@@ -139,16 +168,17 @@ The action-selection procedure must be calibrated using data independent of the 
        REUSE is best     CLONE is best      SCRATCH is best
              |                 |                 |
              v                 v                 v
-       existing slot    copy source slot   fresh new slot
-       stays frozen     -> next slot       -> next slot
+       use existing       copy model state   fresh model state
+       skill unchanged    -> independent     -> independent
+             |               copy                 |
              |                 |                 |
              |                 v                 v
-             |              train clone      train new skill
+             |            train clone        train new skill
              |                 |                 |
              |                 +--------+--------+
              |                          |
              |                          v
-             |                   register new slot
+             |                   register new skill
              |                          |
              +--------------------------+
 ```
@@ -173,43 +203,51 @@ That is not REUSE. It destroys the immutability guarantee.
 The required behavior is:
 
 ```text
-Skill A (slot 0)
+Stored Skill A
        |
-       +---- REUSE ----> use slot 0, do not update slot 0
+       +---- REUSE ----> use A, do not update A
        |
-       +---- CLONE ----> copy slot 0 -> slot 1 -> train slot 1
+       +---- CLONE ----> independent copy of A -> train copy
 ```
 
 After CLONE:
 
 ```text
-slot 0 = original Skill A       [protected]
-slot 1 = adapted Skill A/B      [trainable]
+Skill A = original model state       [protected]
+Skill B = adapted copy of Skill A   [trainable during acquisition]
 ```
 
-The adapted skill is a distinct acquired skill and must have its own memory record and slot identity.
+The adapted skill is a distinct acquired skill and must have its own memory record and identity.
 
-## 6. Why reserved slots are part of the algorithm
+## 6. Why independent skill instances are the generic representation
 
-A whole-model checkpoint copy is not sufficient to express the intended algorithm. A whole-model copy can provide an initialization, but it does not establish which neurons belong to which skill or protect those neurons during later training.
+The current `skill-memory` design uses a separate model per skill. Cloning is a deep copy of the complete model state, and the clone can then be trained independently while the source remains unchanged.
 
-The implementation therefore needs a model/strategy adapter that knows how a model is partitioned into reserved skill regions. The generic Skill Memory layer stores and indexes skills; the adapter owns the actual parameter/neuron routing and protection.
+This gives the generic mechanism a simple capacity model:
 
-The first implementation may use a simple explicit slot architecture for the arithmetic proof of concept. It must not silently pretend that arbitrary unpartitioned Avalanche models already provide isolated neuron slots.
+```text
+capacity = maximum number of independent stored skill models
+```
+
+It does not require the generic registry to know which neurons or parameter ranges belong to a skill.
+
+A whole-model state copy is therefore sufficient **when the underlying model represents one skill per independently stored model state**, which is the reference representation for this prototype.
+
+If a future Avalanche integration wants to pack multiple skills into one shared model, it must provide an explicit model/strategy adapter defining parameter ownership, isolation, activation, and optimizer routing. That is a separate extension and must not be assumed by the generic registry.
 
 ## 7. Skill-memory invariants
 
 1. **Immutability:** a registered source skill never changes as a side effect of another skill's training.
-2. **Unique ownership:** one reserved slot represents one acquired skill version.
-3. **Monotonic allocation:** once a slot has been assigned, the next newly acquired skill uses the next unused slot; an older slot is not overwritten.
-4. **Clone independence:** modifying a clone must not modify its source.
-5. **Reuse isolation:** REUSE must not create a new trainable version of the selected skill.
-6. **Explicit acquisition:** only CLONE and SCRATCH create new skills.
-7. **No test leakage:** compatibility, candidate selection, and action selection must not inspect final evaluation/test labels.
-8. **Sequential processing:** decisions are made as experiences arrive, not after seeing the complete future stream.
-9. **Deterministic slot identity:** slot allocation is reproducible for a fixed experience sequence.
-10. **Capacity accounting:** every newly acquired skill consumes a distinct reserved slot; experiments must report the resulting capacity/parameter cost.
-11. **Scratch fallback:** if no REUSE or CLONE candidate is expected to beat SCRATCH, SCRATCH is selected.
+2. **Independent representation:** each stored acquired skill has its own model state.
+3. **Clone independence:** modifying a clone must not modify its source.
+4. **Reuse isolation:** REUSE does not create a new trainable version of the selected skill.
+5. **Explicit acquisition:** only CLONE and SCRATCH create new skills.
+6. **Capacity accounting:** every newly acquired skill consumes one entry of the configured skill capacity.
+7. **Monotonic acquisition:** a successful acquisition adds a new skill record rather than overwriting an existing skill.
+8. **No test leakage:** compatibility, candidate selection, and action selection must not inspect final test/evaluation labels.
+9. **Sequential processing:** decisions are made as experiences arrive, not after seeing the complete future stream.
+10. **Clone optimizer isolation:** a clone begins adaptation with independent optimizer/training state rather than inheriting the source skill's optimizer history.
+11. **Scratch fallback:** if no REUSE or CLONE action is expected to beat SCRATCH, SCRATCH is selected.
 12. **Matched comparison:** action estimates use the same predefined target criterion and acquisition budget when comparing REUSE, CLONE, and SCRATCH.
 
 ## 8. Compatibility score
@@ -232,20 +270,21 @@ The score may be used to rank or filter candidate skills. It must not be interpr
 
 ## 9. Training semantics
 
-The active optimizer must update only parameters belonging to the active trainable skill region, plus any parameters explicitly declared shared by the model adapter.
+The generic registry stores model states; the active Avalanche strategy is responsible for training the currently selected model.
 
-For REUSE, the selected skill region is frozen. The implementation must not rely solely on loading a copied state dictionary and then continuing ordinary training, because ordinary training would turn that operation into adaptation and therefore violate REUSE semantics.
+For REUSE, the selected stored state is loaded/activated for inference or use, but no training update is applied to that skill. REUSE must not silently turn into adaptation.
 
-For CLONE, the source region is frozen and the destination region is trainable. The destination starts as an exact copy of the source region before training.
+For CLONE, the source state is copied into an independent destination model state. The destination starts as an exact copy of the source model parameters, while optimizer/training state is initialized independently. Training then modifies only the destination acquisition state.
 
-For SCRATCH, the destination region receives fresh initialization.
+For SCRATCH, the destination receives fresh model initialization and independent optimizer/training state.
+
+For model architectures that intentionally share parameters across skills, an explicit adapter must define which parameters are shared and how those parameters are protected. Such sharing is outside the generic registry contract.
 
 ## 10. Registration semantics
 
 A new memory record is created only after CLONE or SCRATCH completes acquisition. Its metadata should include at least:
 
 - skill name/identifier;
-- slot identifier;
 - acquisition mode (`clone` or `scratch`);
 - source skill identifier, if cloned;
 - compatibility score used for candidate selection;
@@ -253,19 +292,15 @@ A new memory record is created only after CLONE or SCRATCH completes acquisition
 - experience/task metadata;
 - creation order.
 
-A REUSE event may be logged for evaluation, but it must not replace the stored source state or create an adapted record.
+A REUSE event may be logged for evaluation, but it must not replace the stored source state or create an adapted skill record.
 
 ## 11. Scientific success criteria and evaluation
 
 The algorithm should not be judged by whether a compatibility score exceeds an arbitrary number. The score is a mechanism for finding promising prior skills. The scientific question is whether the resulting acquisition decision improves learning relative to SCRATCH while preserving previously learned skills.
 
-The primary scientific target is:
-
-> **Improve target-task learning relative to a scratch baseline when prior skills are useful, while preserving previously learned skills, and fall back to scratch when prior skills do not provide an advantage.**
-
 ### 11.1 Scratch baseline
 
-For every target experience, train the target from a fresh reserved slot using the same architecture, capacity budget, training budget, optimizer, data, and comparable random seeds.
+For every target experience, train the target from a fresh model state using the same architecture, training budget, optimizer configuration, data, and comparable random seeds.
 
 SCRATCH is not merely a baseline reported at the end. It is the reference action against which REUSE and CLONE are judged for the current task.
 
@@ -291,7 +326,7 @@ If adaptation is required, REUSE is not a valid success case; CLONE should be co
 
 After acquiring each new skill, evaluate previously acquired skills again. Previously learned skills should not materially degrade relative to their performance immediately after acquisition.
 
-The strongest mechanical test is parameter/state isolation: a source slot must remain bitwise unchanged when its clone is trained, subject only to explicitly documented shared parameters.
+The strongest mechanical test is state isolation: a source skill's stored model state must remain unchanged when its clone is trained.
 
 ### 11.5 Automatic-policy success
 
@@ -308,7 +343,8 @@ Report:
 - selected source skills;
 - compatibility scores;
 - preservation of prior skills;
-- parameter/capacity overhead;
+- number of stored skill instances / capacity usage;
+- parameter and memory overhead;
 - runtime overhead.
 
 The candidate-selection, score-calibration, and action-selection procedures must be fixed before final test evaluation.
@@ -324,7 +360,7 @@ Prove with unit tests that:
 ```text
 REUSE   -> source unchanged
 CLONE   -> source unchanged + clone changes
-SCRATCH -> new slot independent of all previous slots
+SCRATCH -> new independent skill state
 ```
 
 ### Level 2 — Oracle transfer
@@ -350,13 +386,14 @@ Avalanche should provide the normal sequential experience lifecycle, optimizer, 
 Skill Memory should provide:
 
 - skill registry;
+- independent model-state storage;
 - compatibility lookup;
 - candidate selection;
 - action evaluation/policy;
-- slot allocation/state isolation;
-- integration hooks for activating, freezing, and training reserved regions.
+- acquisition bookkeeping and lineage;
+- integration hooks for activating and training the selected skill instance.
 
-The implementation should remain small and model-agnostic at the registry/policy level. Model-specific neuron partitioning belongs behind an explicit adapter rather than being guessed by the generic registry.
+The implementation should remain small and model-agnostic at the registry/policy level. Model-specific parameter partitioning belongs behind an explicit adapter rather than being assumed by the generic registry.
 
 ## 14. Minimal reference pseudocode
 
@@ -374,55 +411,48 @@ for experience in stream:
     decision = policy.choose_best_action(actions)
 
     if decision.kind == SCRATCH:
-        destination = slots.next_free()
-        slots.initialize_fresh(destination)
-        slots.activate_trainable(destination)
+        destination = model_factory()
+        reset_optimizer(destination)
+        train(destination, experience)
+        memory.register(
+            destination,
+            source=None,
+            acquisition_mode="scratch",
+        )
 
     elif decision.kind == CLONE:
-        destination = slots.next_free()
-        slots.copy(decision.source.slot, destination)
-        slots.freeze(decision.source.slot)
-        slots.activate_trainable(destination)
+        destination = deepcopy_model(decision.source)
+        reset_optimizer(destination)
+        train(destination, experience)
+        memory.register(
+            destination,
+            source=decision.source,
+            acquisition_mode="clone",
+        )
 
     elif decision.kind == REUSE:
-        destination = decision.source.slot
-        slots.freeze(destination)
-        slots.activate(destination)
-
-    train_current_experience_only_if(decision.kind != REUSE)
-
-    if decision.kind in (CLONE, SCRATCH):
-        memory.register(
-            slot=destination,
-            source=decision.source if decision.kind == CLONE else None,
-            metadata=experience.metadata,
-        )
+        activate(decision.source)
+        # No training and no new skill record.
 ```
 
-The exact mechanism used to estimate an action's outcome may differ between experiments. The comparison must remain fair: REUSE, CLONE, and SCRATCH must be evaluated under the same predefined target criterion and acquisition budget, and final test information must not be used to choose the action.
+The pseudocode describes the generic semantics. An Avalanche implementation may use the strategy's existing model object and optimizer rather than constructing separate Python model objects, provided that it preserves the same observable invariants: independent skill states, source immutability, independent clone optimizer state, and no training during REUSE.
 
-## 15. Definition of done
+## 15. Implementation checklist
 
-An implementation is faithful to this algorithm only when all of the following are true:
+Before treating the mechanism as complete, verify:
 
-- [ ] Previously acquired skill parameters are protected from later skill training.
-- [ ] REUSE does not update the reused skill.
-- [ ] CLONE creates a physically independent destination parameter region.
-- [ ] Training a clone changes the clone and not its source.
-- [ ] New skills consume reserved slots monotonically.
-- [ ] SCRATCH creates a new slot rather than overwriting an old skill.
-- [ ] Only CLONE and SCRATCH create new learned-skill records.
-- [ ] The compatibility score has a documented interpretation.
-- [ ] The score is used for candidate selection rather than as an arbitrary universal decision threshold.
-- [ ] The action-selection policy explicitly compares viable transfer actions against SCRATCH.
-- [ ] REUSE is selected only when the existing skill is sufficient without adaptation.
-- [ ] CLONE is selected only when adapting the copied skill is expected to beat SCRATCH.
-- [ ] SCRATCH is selected whenever neither REUSE nor CLONE is expected to beat SCRATCH.
-- [ ] Score/policy calibration is performed without final test/evaluation labels.
-- [ ] No arbitrary score thresholds are treated as universal algorithm constants.
-- [ ] The arithmetic proof of concept demonstrates source preservation and clone adaptation.
-- [ ] Oracle transfer demonstrates measurable improvement over scratch where transfer is expected.
-- [ ] The automatic policy is evaluated against scratch across multiple seeds.
+- [ ] A skill is represented by an independently stored model state.
+- [ ] `max_skills` counts stored skill instances, not neurons.
+- [ ] REUSE never trains the selected stored skill.
+- [ ] REUSE does not create a new acquired skill record.
+- [ ] CLONE starts from an exact copy of the source model state.
+- [ ] CLONE uses independent optimizer/training state.
+- [ ] Training a clone cannot modify its source skill.
+- [ ] SCRATCH starts from fresh model initialization.
+- [ ] Only successful CLONE and SCRATCH acquisitions add new skills.
+- [ ] Skill lineage records the source for cloned skills.
+- [ ] Compatibility scoring does not use final evaluation/test labels.
+- [ ] Action selection compares REUSE/CLONE with SCRATCH under matched criteria and budgets.
 - [ ] Previous skills are re-evaluated after subsequent acquisitions.
-- [ ] Capacity and runtime costs are reported.
+- [ ] Capacity, parameter/memory cost, and runtime overhead are reported.
 - [ ] Avalanche's normal sequential training lifecycle remains the integration mechanism.
