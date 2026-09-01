@@ -26,16 +26,20 @@ SEEDS = list(range(15))
 TRAIN_SAMPLES = 64
 EVAL_SAMPLES = 64
 PROBE_SAMPLES = 16
+ADAPTATION_SAMPLES = 64
 TRAIN_SEED_BASE = 100
 EVAL_SEED_BASE = 10_000
 PROBE_SEED_BASE = 50_000
+ADAPTATION_SEED_BASE = 60_000
 EPOCHS = 3
+TRAIN_MB_SIZE = 16
 TASKS = ["multiply", "add", "square", "divide"]
 FORGETTING_TASKS = TASKS[:-1]
 REUSE_THRESHOLD = 0.90
-# Keep the adaptation probe budget matched to the actual training experience:
-# 3 epochs * 4 minibatches per epoch (64 samples / batch size 16) = 12 updates.
-ADAPTATION_STEPS = 12
+# Match the actual Avalanche learner exactly: 64 training samples, minibatch
+# size 16, 3 epochs = 4 deterministic minibatches/epoch = 12 updates.
+ADAPTATION_BATCH_SIZE = TRAIN_MB_SIZE
+ADAPTATION_STEPS = EPOCHS * (TRAIN_SAMPLES // TRAIN_MB_SIZE)
 
 
 def make_model() -> nn.Module:
@@ -111,8 +115,22 @@ def evaluate(model: nn.Module, operation: str, seed: int) -> float:
 
 
 def probe_batch(experience: ArithmeticExperience, seed: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    dataset = make_dataset(operation=experience.operation, n_samples=PROBE_SAMPLES,
-                           seed=PROBE_SEED_BASE + seed * len(TASKS) + experience.current_experience)
+    """Small zero-shot probe used only for REUSE compatibility."""
+    dataset = make_dataset(
+        operation=experience.operation,
+        n_samples=PROBE_SAMPLES,
+        seed=PROBE_SEED_BASE + seed * len(TASKS) + experience.current_experience,
+    )
+    return dataset.tensors
+
+
+def adaptation_data(experience: ArithmeticExperience, seed: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fresh 64-sample adaptation data for the CLONE-vs-SCRATCH scorer."""
+    dataset = make_dataset(
+        operation=experience.operation,
+        n_samples=ADAPTATION_SAMPLES,
+        seed=ADAPTATION_SEED_BASE + seed * len(TASKS) + experience.current_experience,
+    )
     return dataset.tensors
 
 
@@ -136,6 +154,8 @@ def build_strategy(use_skill_memory: bool, seed: int, force_decision: str = None
             model_factory=make_model,
             loss_fn=nn.functional.mse_loss,
             probe_fn=lambda exp: probe_batch(exp, seed),
+            adaptation_fn=lambda exp: adaptation_data(exp, seed),
+            batch_size=ADAPTATION_BATCH_SIZE,
             steps=ADAPTATION_STEPS,
             optimizer_factory=lambda parameters: torch.optim.Adam(parameters, lr=1e-2),
         )
@@ -158,7 +178,7 @@ def build_strategy(use_skill_memory: bool, seed: int, force_decision: str = None
         model=model,
         optimizer=optimizer,
         criterion=nn.MSELoss(),
-        train_mb_size=16,
+        train_mb_size=TRAIN_MB_SIZE,
         train_epochs=EPOCHS,
         eval_mb_size=16,
         eval_every=-1,
@@ -205,6 +225,9 @@ def run_condition(use_skill_memory: bool, seed: int, force_decision: str = None)
         "condition": "skill_memory" if use_skill_memory else "baseline",
         "seed": seed,
         "epochs_per_experience": EPOCHS,
+        "train_mb_size": TRAIN_MB_SIZE,
+        "adaptation_samples_for_clone_decision": ADAPTATION_SAMPLES,
+        "adaptation_batch_size_for_clone_decision": ADAPTATION_BATCH_SIZE,
         "adaptation_steps_for_clone_decision": ADAPTATION_STEPS,
         "mse_history": mse_history,
         "final_mse": final_mse,
@@ -298,13 +321,16 @@ def main() -> None:
     oracle_runs = {condition: [item[condition] for item in results] for condition in ("reuse", "clone", "scratch")}
 
     result = {
-        "benchmark": "skill_memory_arithmetic_multiseed_v5_adaptation_policy",
-        "description": "15-seed baseline plus oracle control benchmark using zero-shot evidence for REUSE and matched-budget adaptation value for CLONE.",
+        "benchmark": "skill_memory_arithmetic_multiseed_v6_matched_adaptation",
+        "description": "15-seed baseline plus oracle control benchmark. CLONE scoring now adapts candidate and SCRATCH models on the same 64 fresh training-distribution samples using batch size 16 for exactly 12 deterministic optimizer updates, matching the Avalanche learner's 3 epochs of 4 minibatches.",
         "policy": {
             "reuse_threshold": REUSE_THRESHOLD,
             "clone_threshold": None,
             "clone_rule": "select the stored candidate with the greatest positive post-adaptation improvement over a fresh model; otherwise SCRATCH",
+            "adaptation_samples": ADAPTATION_SAMPLES,
+            "adaptation_batch_size": ADAPTATION_BATCH_SIZE,
             "adaptation_steps": ADAPTATION_STEPS,
+            "adaptation_epochs_equivalent": EPOCHS,
             "probe": "fresh samples from the new experience training distribution; never the evaluation stream",
         },
         "seeds": SEEDS,
