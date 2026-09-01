@@ -4,6 +4,8 @@
 
 This document is the normative definition of the Skill Memory algorithm implemented and investigated in this branch. It takes precedence over prototype wording that treats REUSE and CLONE as equivalent model initialization operations.
 
+The document defines the algorithmic semantics independently from any particular compatibility-score thresholds. Thresholds are experimental policy parameters and must not be treated as scientific constants.
+
 ## 1. Objective
 
 Skill Memory is a continual skill-acquisition mechanism. Its purpose is to let a learner acquire new skills sequentially while preserving previously acquired skills and exploiting useful prior skills when a later experience is compatible.
@@ -20,11 +22,11 @@ Skill Memory is not defined as replay, and it is not merely a checkpoint registr
 
 ### Skill
 
-A learned capability represented by a model parameter region (a reserved skill slot) together with the metadata needed to identify and score it.
+A learned capability represented by a model parameter/neuron region (a reserved skill slot) together with the metadata needed to identify and score it.
 
 ### Reserved skill slot
 
-A region of model parameters/neuron capacity assigned to exactly one acquired skill. Once a slot has been committed to a learned skill, its parameters are protected from subsequent training unless that skill is explicitly being trained as a new clone in a different slot.
+A region of model parameters/neuron capacity assigned to exactly one acquired skill. Once a slot has been committed to a learned skill, its parameters are protected from subsequent training.
 
 Slots are allocated in deterministic order: slot 0, slot 1, slot 2, and so on. The algorithm therefore grows the collection of acquired skills through successive reserved regions rather than rewriting an earlier skill.
 
@@ -32,13 +34,19 @@ Slots are allocated in deterministic order: slot 0, slot 1, slot 2, and so on. T
 
 Use an existing skill directly. The selected skill's reserved parameters remain frozen. No gradient update is applied to that skill and no replacement copy is created. REUSE therefore cannot change the learned source skill.
 
+REUSE is a **use operation, not an acquisition operation**.
+
 ### CLONE
 
 Copy the selected source skill from its reserved slot into the next unused reserved slot. The destination slot becomes the active skill for the new experience. Training is allowed to modify only the destination slot (and any explicitly designated shared parameters, if the model architecture declares them). The source slot remains unchanged.
 
+CLONE is an **acquisition operation**.
+
 ### SCRATCH
 
 Allocate the next unused reserved slot and initialize it from the normal fresh initialization. Train the new skill in that slot.
+
+SCRATCH is an **acquisition operation**.
 
 ## 3. Sequential algorithm
 
@@ -46,14 +54,23 @@ For experiences `E_1, E_2, ..., E_T`:
 
 1. Start with an empty Skill Memory and the first unused reserved slot.
 2. Receive the next experience through the normal Avalanche experience lifecycle.
-3. Compute a compatibility score for each stored skill using only information permitted for training-time decision making. Never use held-out test labels.
+3. Compute a compatibility score for each stored skill using only information permitted for training-time decision making. Never use held-out final evaluation/test labels.
 4. Select the highest-scoring candidate.
-5. Apply the decision policy:
+5. Apply a calibrated policy that maps the score to REUSE, CLONE, or SCRATCH.
+6. For **REUSE**, activate the selected existing skill and keep its reserved parameters frozen. Do not train it and do not create a new skill record.
+7. For **CLONE**, copy the selected source slot into the next unused slot, activate the destination slot, and train only the destination. The source remains protected.
+8. For **SCRATCH**, initialize the next unused slot normally and train it.
+9. After a successful CLONE or SCRATCH acquisition, register the destination slot as a new skill in memory.
+10. Continue to the next experience.
+
+### Policy thresholds
+
+No universal values such as `0.90` and `0.30` are part of the algorithm. The score scale and thresholds must be established by calibration on data that is independent of the final evaluation set.
+
+For an initial experiment, a simple three-way policy may be used:
 
 ```text
-if memory is empty:
-    SCRATCH
-elif score >= reuse_threshold:
+if score >= reuse_threshold:
     REUSE
 elif score >= clone_threshold:
     CLONE
@@ -61,14 +78,9 @@ else:
     SCRATCH
 ```
 
-Default experimental thresholds are `reuse_threshold = 0.90` and `clone_threshold = 0.30`. They are configurable hypotheses, not fixed scientific constants.
+The values are experimental parameters. They should be selected before the final test and reported with the experiment rather than silently tuned on test results.
 
-6. For **REUSE**, route the experience to the selected skill slot and protect that slot from optimizer updates. The existing skill remains exactly as stored.
-7. For **CLONE**, copy the selected slot into the next unused slot, activate the new slot, and train the new slot. The source slot is protected.
-8. For **SCRATCH**, initialize the next unused slot normally and train it.
-9. After a successful CLONE or SCRATCH acquisition, register the destination slot as a new skill in memory.
-10. After REUSE, do not replace or update the source skill record merely because the experience was processed.
-11. Continue to the next experience.
+A useful calibration procedure is to measure, for held-out calibration tasks, whether using a candidate unchanged is already sufficient, whether initializing a fresh slot from that candidate gives a measurable learning advantage, or whether scratch is preferable. Thresholds can then be chosen from those calibration outcomes rather than from arbitrary score values.
 
 ## 4. State-transition model
 
@@ -83,7 +95,7 @@ Default experimental thresholds are `reuse_threshold = 0.90` and `clone_threshol
                                |
              +-----------------+-----------------+
              |                 |                 |
-        high score        medium score      low/no score
+          high score       middle score      low score
              |                 |                 |
            REUSE             CLONE            SCRATCH
              |                 |                 |
@@ -150,6 +162,7 @@ The first implementation may use a simple explicit slot architecture for the ari
 7. **No test leakage:** compatibility and policy decisions must not inspect final evaluation/test labels.
 8. **Sequential processing:** decisions are made as experiences arrive, not after seeing the complete future stream.
 9. **Deterministic slot identity:** slot allocation is reproducible for a fixed experience sequence.
+10. **Capacity accounting:** every newly acquired skill consumes a distinct reserved slot; experiments must report the resulting capacity/parameter cost.
 
 ## 8. Compatibility score
 
@@ -163,7 +176,7 @@ For a candidate with probe error `L_skill` and reference error `L_ref`, one poss
 score = clamp(1 - L_skill / L_ref, 0, 1)
 ```
 
-The probe must come from allowed training/calibration data, never from the final evaluation stream.
+The exact scoring function is an experimental component and must be reported with the experiment. The probe must come from allowed training/calibration data, never from the final evaluation stream.
 
 ## 9. Training semantics
 
@@ -189,31 +202,85 @@ A new memory record is created only after CLONE or SCRATCH completes acquisition
 
 A REUSE event may be logged for evaluation, but it must not replace the stored source state or create an adapted record.
 
-## 11. Evaluation
+## 11. Scientific success criteria and evaluation
 
-The primary scientific comparison is:
+The algorithm should not be judged by whether a compatibility score exceeds an arbitrary number. The score is only a mechanism for making an acquisition decision.
 
-1. **Scratch:** each target skill starts in a fresh slot.
-2. **Clone:** the target starts from the selected prior skill copied into a new slot.
-3. **Automatic Skill Memory:** the score selects REUSE, CLONE, or SCRATCH.
+The primary target is **improvement over a scratch baseline** while preserving previously learned skills.
 
-All three must use the same model capacity accounting, training budget, seeds, and final evaluation data.
+### 11.1 Scratch baseline
 
-Measure:
+For every target experience, train the target from a fresh reserved slot using the same architecture, capacity budget, training budget, optimizer, data, and random seeds where applicable.
 
+### 11.2 Transfer benefit
+
+For a target that has a genuinely useful prior skill, CLONE is successful when it provides measurable benefit over SCRATCH. Benefit should be measured primarily by:
+
+- lower final target error under a fixed training budget; and/or
+- fewer training steps/epochs to reach the same target error.
+
+A single metric is insufficient because a method can reach the same final performance much faster or improve final performance under the same budget.
+
+### 11.3 REUSE benefit
+
+REUSE is successful only when using the existing skill unchanged is sufficient for the new task and does not require adaptation. Its main evidence is:
+
+- target performance is already adequate without updating the skill; and
+- the reused skill remains exactly unchanged.
+
+REUSE should not be counted as a transfer-learning improvement merely because it avoids training. If the task requires adaptation, it should be a CLONE candidate instead.
+
+### 11.4 Preservation
+
+After acquiring each new skill, evaluate previously acquired skills again. The primary preservation criterion is that previously learned skills do not materially degrade compared with their state immediately after acquisition.
+
+The strongest mechanical test is parameter/state isolation: a source slot must remain bitwise unchanged when its clone is trained, subject only to explicitly documented shared parameters.
+
+### 11.5 Automatic-policy success
+
+The automatic Skill Memory policy is successful when, across multiple seeds and target tasks, it provides a statistically supported improvement over the scratch baseline on transfer-appropriate tasks **without causing unacceptable degradation on non-transfer tasks or previously learned skills**.
+
+Report:
+
+- mean and dispersion/confidence intervals across seeds;
 - final target performance;
-- training needed to reach a fixed target performance;
-- decision sequence;
-- selected source skill;
-- compatibility score;
-- benefit of the decision;
-- runtime overhead;
-- memory/parameter overhead;
-- preservation of every previously learned skill.
+- training steps to target performance;
+- decision distribution (REUSE/CLONE/SCRATCH);
+- selected source skills;
+- compatibility scores;
+- preservation of prior skills;
+- parameter/capacity overhead;
+- runtime overhead.
 
-The arithmetic sequence should contain genuine dependencies, such as learning multiplication before square, so that CLONE tests useful transfer rather than an arbitrary checkpoint copy.
+Do not select score thresholds after inspecting the final test results.
 
-## 12. Avalanche integration boundary
+## 12. Experimental hierarchy
+
+Experiments should be performed in the following order so that policy errors are not confused with mechanism errors.
+
+### Level 1 — Mechanism validity
+
+Prove with unit tests that:
+
+```text
+REUSE  -> source unchanged
+CLONE  -> source unchanged + clone changes
+SCRATCH -> new slot independent of all previous slots
+```
+
+### Level 2 — Oracle transfer
+
+Provide the correct acquisition decision externally. Demonstrate that when CLONE is appropriate, a cloned skill can learn the target faster and/or better than SCRATCH.
+
+This isolates the value of the cloning mechanism from the compatibility scorer.
+
+### Level 3 — Automatic policy
+
+Use the compatibility score to select REUSE/CLONE/SCRATCH. Evaluate the policy against SCRATCH and appropriate control policies on unseen target tasks.
+
+This isolates the quality of the decision mechanism.
+
+## 13. Avalanche integration boundary
 
 Avalanche should provide the normal sequential experience lifecycle, optimizer, model, datasets, evaluation, and plugin mechanism.
 
@@ -223,31 +290,29 @@ Skill Memory should provide:
 - compatibility lookup;
 - acquisition decision;
 - slot allocation/state isolation;
-- integration hooks for activating/freeze/trainable regions.
+- integration hooks for activating, freezing, and training reserved regions.
 
 The implementation should remain small and model-agnostic at the registry/policy level. Model-specific neuron partitioning belongs behind an explicit adapter rather than being guessed by the generic registry.
 
-## 13. Minimal reference pseudocode
+## 14. Minimal reference pseudocode
 
 ```python
 for experience in stream:
     candidate, score = memory.best_match(experience)
+    decision = policy(score, calibrated_thresholds)
 
-    if candidate is None or score < clone_threshold:
-        decision = SCRATCH
+    if candidate is None or decision == SCRATCH:
         destination = slots.next_free()
         slots.initialize_fresh(destination)
         slots.activate_trainable(destination)
 
-    elif score < reuse_threshold:
-        decision = CLONE
+    elif decision == CLONE:
         destination = slots.next_free()
         slots.copy(candidate.slot, destination)
         slots.freeze(candidate.slot)
         slots.activate_trainable(destination)
 
-    else:
-        decision = REUSE
+    elif decision == REUSE:
         destination = candidate.slot
         slots.freeze(destination)
         slots.activate(destination)
@@ -264,7 +329,7 @@ for experience in stream:
 
 The exact mechanism used to route data to a slot may differ between architectures, but the semantics above must remain unchanged.
 
-## 14. Definition of done
+## 15. Definition of done
 
 An implementation is faithful to this algorithm only when all of the following are true:
 
@@ -275,7 +340,11 @@ An implementation is faithful to this algorithm only when all of the following a
 - [ ] New skills consume reserved slots monotonically.
 - [ ] SCRATCH creates a new slot rather than overwriting an old skill.
 - [ ] Only CLONE and SCRATCH create new learned-skill records.
-- [ ] The automatic policy is score-driven and configurable.
-- [ ] No test/evaluation labels enter compatibility decisions.
+- [ ] The automatic policy is score-driven and its thresholds are calibrated rather than assumed to be universal constants.
+- [ ] No test/evaluation labels enter compatibility decisions or threshold selection.
 - [ ] The arithmetic proof of concept demonstrates source preservation and clone adaptation.
+- [ ] Oracle transfer demonstrates measurable improvement over scratch where transfer is expected.
+- [ ] The automatic policy is evaluated against scratch across multiple seeds.
+- [ ] Previous skills are re-evaluated after subsequent acquisitions.
+- [ ] Capacity and runtime costs are reported.
 - [ ] Avalanche's normal sequential training lifecycle remains the integration mechanism.
