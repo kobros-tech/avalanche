@@ -1,4 +1,4 @@
-"""Avalanche plugin for score-driven skill acquisition."""
+"""Avalanche plugin for evidence-driven skill acquisition."""
 
 from __future__ import annotations
 
@@ -13,12 +13,10 @@ from .memory import SkillMemory, SkillRecord
 class SkillMemoryPlugin(SupervisedPlugin):
     """Choose REUSE, CLONE, or SCRATCH for each sequential experience.
 
-    REUSE activates an existing stored skill without training or registering a
-    new skill. CLONE starts from an independent copy of a stored skill, resets
-    the optimizer state, trains it, and registers the result as a new skill.
-    SCRATCH restores the model's initial state, resets the optimizer, trains it,
-    and registers the result as a new skill. The registry itself remains
-    immutable.
+    When ``clone_compatibility`` is supplied, automatic policy selection uses
+    zero-shot compatibility only for REUSE and uses matched post-adaptation
+    value for CLONE. A clone is selected only when its measured improvement
+    over a fresh model is positive; otherwise SCRATCH is the fallback.
     """
 
     REUSE = "reuse"
@@ -31,6 +29,7 @@ class SkillMemoryPlugin(SupervisedPlugin):
         *,
         skill_name: Callable[[Any], str] = lambda exp: str(exp.current_experience),
         compatibility: Optional[Callable[[SkillRecord, Any], float]] = None,
+        clone_compatibility: Optional[Callable[[SkillRecord, Any], float]] = None,
         skill_metadata: Optional[Callable[[Any], Mapping[str, Any]]] = None,
         reuse_threshold: float = 0.90,
         clone_threshold: float = 0.30,
@@ -57,6 +56,7 @@ class SkillMemoryPlugin(SupervisedPlugin):
         self.memory = memory if memory is not None else SkillMemory()
         self.skill_name = skill_name
         self.compatibility = compatibility
+        self.clone_compatibility = clone_compatibility
         self.skill_metadata = skill_metadata
         self.reuse_threshold = reuse_threshold
         self.clone_threshold = clone_threshold
@@ -67,6 +67,7 @@ class SkillMemoryPlugin(SupervisedPlugin):
         self.last_selected_skill: Optional[str] = None
         self.last_reused_skill: Optional[str] = None
         self.last_compatibility_score: float = 0.0
+        self.last_clone_value: float = 0.0
         self._saved_train_epochs: Optional[int] = None
         self._initial_model_state: Optional[dict[str, Any]] = None
 
@@ -78,7 +79,6 @@ class SkillMemoryPlugin(SupervisedPlugin):
             optimizer.state.clear()
 
     def _capture_initial_model_state(self, strategy) -> None:
-        """Capture the model initialization used by the first experience."""
         if self._initial_model_state is None:
             self._initial_model_state = {
                 key: value.detach().cpu().clone()
@@ -86,10 +86,13 @@ class SkillMemoryPlugin(SupervisedPlugin):
             }
 
     def _restore_initial_model_state(self, strategy) -> None:
-        """Restore a fresh acquisition state for SCRATCH."""
         if self._initial_model_state is None:
             raise RuntimeError("initial model state has not been captured")
         strategy.model.load_state_dict(deepcopy(self._initial_model_state))
+
+    def _scratch(self, strategy) -> None:
+        self._restore_initial_model_state(strategy)
+        self._reset_optimizer(strategy)
 
     def before_training_exp(self, strategy, **kwargs):
         """Select acquisition mode and initialize the active learner."""
@@ -98,57 +101,94 @@ class SkillMemoryPlugin(SupervisedPlugin):
         self.last_selected_skill = None
         self.last_reused_skill = None
         self.last_compatibility_score = 0.0
+        self.last_clone_value = 0.0
         self._saved_train_epochs = None
 
-        if self.compatibility is None or len(self.memory) == 0:
-            self._restore_initial_model_state(strategy)
-            self._reset_optimizer(strategy)
+        if len(self.memory) == 0:
+            self._scratch(strategy)
             return
 
-        if self.force_decision == self.SCRATCH:
-            _, self.last_compatibility_score = self.memory.best_match(
+        # REUSE requires a zero-shot compatibility estimator. If none is
+        # supplied, automatic policy cannot safely select REUSE.
+        reuse_record = None
+        reuse_score = 0.0
+        if self.compatibility is not None:
+            reuse_record, reuse_score = self.memory.best_match(
                 strategy.experience, self.compatibility, threshold=0.0
             )
-            self._restore_initial_model_state(strategy)
-            self._reset_optimizer(strategy)
+        self.last_compatibility_score = reuse_score
+
+        if self.force_decision == self.SCRATCH:
+            self._scratch(strategy)
             return
 
-        query_threshold = 0.0 if self.force_decision else self.clone_threshold
-        record, score = self.memory.best_match(
-            strategy.experience, self.compatibility, threshold=query_threshold
-        )
-        self.last_compatibility_score = score
-        if record is None:
-            self._restore_initial_model_state(strategy)
-            self._reset_optimizer(strategy)
-            return
-
-        self.last_selected_skill = record.name
-        decision = self.force_decision
-        if decision is None:
-            decision = self.REUSE if score >= self.reuse_threshold else self.CLONE
-        self.last_decision = decision
-
-        if decision == self.REUSE:
-            self.last_reused_skill = record.name
-            self.memory.load_into(record.name, strategy.model)
+        if self.force_decision == self.REUSE:
+            if reuse_record is None:
+                self._scratch(strategy)
+                return
+            self.last_selected_skill = reuse_record.name
+            self.last_reused_skill = reuse_record.name
+            self.last_decision = self.REUSE
+            self.memory.load_into(reuse_record.name, strategy.model)
             if hasattr(strategy, "train_epochs"):
                 self._saved_train_epochs = strategy.train_epochs
                 strategy.train_epochs = 0
             return
 
-        # CLONE starts from the stored source state, but the optimizer belongs
-        # to the new acquisition and must not carry state from the source's
-        # previous training history.
-        if decision == self.CLONE:
+        if self.force_decision == self.CLONE:
+            scorer = self.clone_compatibility or self.compatibility
+            if scorer is None:
+                self._scratch(strategy)
+                return
+            record, value = self.memory.best_match(
+                strategy.experience, scorer, threshold=0.0
+            )
+            self.last_clone_value = value
+            if record is None or value <= 0.0:
+                self._scratch(strategy)
+                return
+            self.last_selected_skill = record.name
+            self.last_decision = self.CLONE
             self.memory.load_into(record.name, strategy.model)
             self._reset_optimizer(strategy)
             return
 
-        # A forced decision can only be one of the three constants. Keep the
-        # fallback explicit in case this code is extended later.
-        self._restore_initial_model_state(strategy)
-        self._reset_optimizer(strategy)
+        # Automatic policy: REUSE is considered only when the stored skill
+        # already solves the task strongly. Otherwise evaluate each candidate
+        # by matched-budget adaptation value. Positive improvement over fresh
+        # initialization is the evidence required to CLONE. If no candidate
+        # beats scratch, SCRATCH is selected.
+        if reuse_record is not None and reuse_score >= self.reuse_threshold:
+            self.last_selected_skill = reuse_record.name
+            self.last_reused_skill = reuse_record.name
+            self.last_decision = self.REUSE
+            self.memory.load_into(reuse_record.name, strategy.model)
+            if hasattr(strategy, "train_epochs"):
+                self._saved_train_epochs = strategy.train_epochs
+                strategy.train_epochs = 0
+            return
+
+        if self.clone_compatibility is not None:
+            record, value = self.memory.best_match(
+                strategy.experience, self.clone_compatibility, threshold=0.0
+            )
+            self.last_clone_value = value
+            if record is not None and value > 0.0:
+                self.last_selected_skill = record.name
+                self.last_decision = self.CLONE
+                self.memory.load_into(record.name, strategy.model)
+                self._reset_optimizer(strategy)
+                return
+        elif reuse_record is not None and reuse_score >= self.clone_threshold:
+            # Backward-compatible threshold policy for callers that have not
+            # provided an adaptation-aware scorer yet.
+            self.last_selected_skill = reuse_record.name
+            self.last_decision = self.CLONE
+            self.memory.load_into(reuse_record.name, strategy.model)
+            self._reset_optimizer(strategy)
+            return
+
+        self._scratch(strategy)
 
     def after_training_exp(self, strategy, **kwargs):
         """Restore settings and register only newly acquired skills."""
@@ -156,8 +196,6 @@ class SkillMemoryPlugin(SupervisedPlugin):
             strategy.train_epochs = self._saved_train_epochs
             self._saved_train_epochs = None
 
-        # REUSE is a use operation, not an acquisition operation. The source
-        # record remains unchanged and no new memory record is created.
         if self.last_decision == self.REUSE:
             return
 
@@ -170,6 +208,7 @@ class SkillMemoryPlugin(SupervisedPlugin):
                 "selected_skill": self.last_selected_skill,
                 "reused_from": self.last_reused_skill,
                 "compatibility_score": self.last_compatibility_score,
+                "clone_value": self.last_clone_value,
             }
         )
 
