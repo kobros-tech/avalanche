@@ -1,7 +1,11 @@
 import torch
 from torch import nn
 
-from avalanche.training.skill_memory import AdaptationCompatibilityScorer, SkillMemory, SkillMemoryPlugin
+from avalanche.training.skill_memory import (
+    AdaptationCompatibilityScorer,
+    SkillMemory,
+    SkillMemoryPlugin,
+)
 
 
 class Experience:
@@ -77,7 +81,7 @@ def test_automatic_policy_scratches_when_candidate_does_not_beat_scratch():
     memory = SkillMemory()
     source = factory()
     with torch.no_grad():
-        source.weight.fill_(0.0)
+        source.weight.fill_(100.0)
     memory.register("bad", source.state_dict())
 
     x = torch.tensor([[1.0], [2.0], [3.0], [4.0]])
