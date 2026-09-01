@@ -126,7 +126,7 @@ def test_memory_state_round_trip_preserves_skills_and_metadata():
         assert torch.equal(value, restored.get("a").state_dict[key])
 
 
-def test_plugin_reuses_and_then_registers_skill_with_metadata():
+def test_plugin_reuse_does_not_register_a_new_skill():
     source = nn.Linear(1, 1)
     target = nn.Linear(1, 1)
     with torch.no_grad():
@@ -147,14 +147,58 @@ def test_plugin_reuses_and_then_registers_skill_with_metadata():
     strategy.experience = DummyExperience(1)
 
     plugin.before_training_exp(strategy)
+    assert plugin.last_decision == plugin.REUSE
     assert plugin.last_reused_skill == "source"
     assert torch.allclose(target.weight, source.weight)
     assert torch.allclose(target.bias, source.bias)
 
     plugin.after_training_exp(strategy)
+    assert not memory.contains("task-1")
+    assert memory.names() == ["source"]
+
+
+def test_plugin_clone_registers_new_skill_and_resets_optimizer():
+    source = nn.Linear(1, 1)
+    target = nn.Linear(1, 1)
+    with torch.no_grad():
+        source.weight.fill_(3.0)
+        source.bias.fill_(2.0)
+
+    memory = SkillMemory()
+    memory.register("source", source.state_dict())
+    plugin = SkillMemoryPlugin(
+        memory,
+        skill_name=lambda exp: f"task-{exp.current_experience}",
+        compatibility=lambda _, __: 0.5,
+        threshold=0.3,
+    )
+    strategy = DummyStrategy(target)
+    strategy.experience = DummyExperience(1)
+
+    # Simulate optimizer history from an earlier training phase. CLONE must
+    # start with a fresh optimizer state for the new acquired skill.
+    parameter = next(target.parameters())
+    strategy.optimizer.state[parameter] = {
+        "momentum_buffer": torch.ones_like(parameter)
+    }
+
+    plugin.before_training_exp(strategy)
+
+    assert plugin.last_decision == plugin.CLONE
+    assert plugin.last_selected_skill == "source"
+    assert torch.allclose(target.weight, source.weight)
+    assert torch.allclose(target.bias, source.bias)
+    assert len(strategy.optimizer.state) == 0
+
+    with torch.no_grad():
+        target.weight.add_(10.0)
+        target.bias.add_(10.0)
+
+    plugin.after_training_exp(strategy)
     assert memory.contains("task-1")
-    assert memory.get("task-1").metadata["task_id"] == 1
-    assert memory.get("task-1").metadata["reused_from"] == "source"
+    assert memory.get("task-1").metadata["acquisition_decision"] == plugin.CLONE
+    assert torch.allclose(memory.get("source").state_dict["weight"], source.weight - 10.0)
+    assert not torch.allclose(memory.get("task-1").state_dict["weight"], memory.get("source").state_dict["weight"])
 
 
 def test_plugin_does_not_overwrite_existing_skill_by_default():
@@ -224,6 +268,7 @@ def test_plugin_falls_back_when_no_skill_is_compatible():
 
     assert plugin.last_reused_skill is None
     assert plugin.last_compatibility_score == pytest.approx(0.1)
+    assert plugin.last_decision == plugin.SCRATCH
 
 
 def test_plugin_runs_across_sequential_experiences():
@@ -265,7 +310,7 @@ def test_plugin_runs_across_sequential_experiences():
 
     strategy.train(benchmark.train_stream[1])
     assert plugin.last_reused_skill == "experience-0"
-    assert memory.contains("experience-1")
+    assert not memory.contains("experience-1")
     assert seen == [1]
 
 
@@ -342,5 +387,5 @@ def test_plugin_runs_inside_real_avalanche_training_loop():
     strategy.train(benchmark.train_stream[0])
 
     assert plugin.last_reused_skill == "seed-skill"
-    assert memory.contains("experience-0")
-    assert memory.get("experience-0").metadata["reused_from"] == "seed-skill"
+    assert not memory.contains("experience-0")
+    assert memory.names() == ["seed-skill"]
