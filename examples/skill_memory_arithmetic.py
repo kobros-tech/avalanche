@@ -52,7 +52,9 @@ class ArithmeticExperience:
         return self
 
 
-def make_dataset(operation: str, n_samples: int, seed: int) -> ArithmeticDataset:
+def make_dataset(
+    operation: str, n_samples: int, seed: int
+) -> ArithmeticDataset:
     """Create deterministic train/evaluation data for one arithmetic operation."""
     generator = torch.Generator().manual_seed(seed)
     x = torch.rand(n_samples, 2, generator=generator) * 4.0 + 1.0
@@ -115,7 +117,11 @@ def main() -> None:
         make_experience(3, "divide", ("division",)),
     ]
 
-    model = nn.Sequential(nn.Linear(2, 16), nn.ReLU(), nn.Linear(16, 1))
+    model = nn.Sequential(
+        nn.Linear(2, 16),
+        nn.ReLU(),
+        nn.Linear(16, 1),
+    )
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
     memory = SkillMemory(max_skills=8)
     decisions: Dict[str, str] = {}
@@ -169,10 +175,8 @@ def main() -> None:
     assert decisions["add"] == "acquire"
     assert decisions["square"] == "reuse:multiply"
     assert decisions["divide"] == "acquire"
-    assert memory.contains("multiply")
-    assert memory.contains("add")
-    assert memory.contains("square")
-    assert memory.contains("divide")
+    assert memory.names() == ["multiply", "add", "divide"]
+    assert not memory.contains("square")
 
     print(f"stored_skills={memory.names()}")
     print("Arithmetic Skill Memory PoC completed successfully.")

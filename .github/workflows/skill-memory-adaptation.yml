@@ -1,0 +1,27 @@
+name: Skill Memory adaptation policy
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feature/skill-memory-prototype
+    paths:
+      - 'avalanche/training/skill_memory/**'
+      - 'tests/training/test_skill_memory_adaptation.py'
+
+jobs:
+  adaptation:
+    runs-on: ubuntu-latest
+    container:
+      image: continualai/avalanche-test-3.11:latest
+    defaults:
+      run:
+        shell: bash -l -c "conda run -n avalanche-env --no-capture-output bash {0}"
+    steps:
+      - uses: actions/checkout@v3
+      - name: Run adaptation-aware policy tests
+        env:
+          FAST_TEST: "True"
+          USE_GPU: "False"
+          PYTHONPATH: ${{ github.workspace }}
+        run: pytest -n 0 tests/training/test_skill_memory_adaptation.py -v

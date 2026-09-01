@@ -10,3 +10,4 @@ from .regularization import *
 from .supervised import *
 from .storage_policy import *
 from .losses import *
+from .skill_memory import *
