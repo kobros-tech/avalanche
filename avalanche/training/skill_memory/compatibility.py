@@ -13,13 +13,7 @@ from .memory import SkillRecord
 
 @dataclass
 class ProbeCompatibilityScorer:
-    """Score a stored skill by zero-shot error on a live training-data probe.
-
-    The returned score is normalized against a task-specific reference error.
-    It is useful for identifying candidates that may already solve the task,
-    but it does not by itself measure whether a candidate is a useful training
-    initialization.
-    """
+    """Score a stored skill by zero-shot error on a live training-data probe."""
 
     model_factory: Callable[[], nn.Module]
     loss_fn: Callable[[Tensor, Tensor], Tensor]
@@ -42,14 +36,16 @@ class ProbeCompatibilityScorer:
 
 @dataclass
 class AdaptationCompatibilityScorer:
-    """Measure whether a stored skill is a better initialization than scratch.
+    """Measure transfer value against a fair, matched SCRATCH control.
 
-    Both the candidate and a fresh model are adapted for exactly the same
-    number of gradient steps on the same probe. The score is the normalized
-    post-adaptation improvement over the fresh-model baseline. A positive
-    score means the candidate produced lower post-adaptation loss than
-    SCRATCH; zero means it did not. The probe must come only from the new
-    experience's training data and must never be the final evaluation stream.
+    Candidate and SCRATCH models receive the same probe, optimizer and number
+    of gradient updates. The SCRATCH model is initialized from the exact same
+    RNG state as the candidate's factory call, eliminating initialization noise
+    from the comparison. The adaptation budget should match the number of
+    optimizer updates available during the corresponding training experience.
+
+    The probe must come only from the new experience's training distribution;
+    it must never be the final evaluation stream.
     """
 
     model_factory: Callable[[], nn.Module]
@@ -78,18 +74,21 @@ class AdaptationCompatibilityScorer:
             raise ValueError("steps must be non-negative")
         x, y = self.probe_fn(query)
 
+        rng_state = torch.random.get_rng_state()
         candidate = self.model_factory()
         candidate.load_state_dict(record.state_dict)
         candidate_loss = self._adapt(candidate, x, y)
 
+        # Use the exact same fresh initialization that would have been used
+        # immediately before candidate construction. This makes the control
+        # comparison about the stored initialization, not random luck.
+        torch.random.set_rng_state(rng_state)
         scratch = self.model_factory()
         scratch_loss = self._adapt(scratch, x, y)
+
         if scratch_loss <= self.min_scratch_loss:
             return 0.0
 
-        # Positive means the candidate is better than a fresh initialization
-        # after the same adaptation budget. Negative evidence is clamped to 0
-        # because the plugin treats SCRATCH as the safe fallback.
         score = 1.0 - candidate_loss / scratch_loss
         return max(0.0, min(1.0, score))
 
