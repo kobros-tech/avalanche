@@ -43,6 +43,7 @@ jobs:
             -k "not test_plugin_runs_inside_real_avalanche_training_loop"
           pytest -n 0 tests/training/test_skill_memory_policy.py -v
           pytest -n 0 tests/training/test_skill_memory_compatibility.py -v
+          pytest -n 0 tests/training/test_skill_memory_adaptation.py -v
       - name: Run Skill Memory Avalanche integration test
         env:
           FAST_TEST: "True"
@@ -72,6 +73,8 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}
         run: |
           python examples/skill_memory_benchmark.py
+      - name: Verify multi-seed benchmark JSON
+        run: test -s results/skill_memory_benchmark_multiseed.json
       - name: Run Skill Memory policy oracle comparison
         env:
           FAST_TEST: "True"
@@ -79,6 +82,8 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}
         run: |
           python examples/skill_memory_policy_oracle.py
+      - name: Verify policy oracle JSON
+        run: test -s results/skill_memory_arithmetic_policy_oracle.json
       - name: Run standard RotatedMNIST benchmark (FAST_TEST-sized)
         env:
           FAST_TEST: "True"
@@ -86,6 +91,8 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}
         run: |
           python examples/skill_memory_standard_benchmark.py
+      - name: Verify standard benchmark JSON
+        run: test -s results/skill_memory_rotated_mnist.json
       - name: Upload multi-seed benchmark result
         uses: actions/upload-artifact@v4
         with:
