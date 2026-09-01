@@ -47,14 +47,16 @@ def test_adaptation_scorer_detects_useful_initialization():
 
 
 def test_adaptation_scorer_matches_minibatch_update_structure():
-    """12 updates must consume four 16-sample batches for three epochs."""
+    """12 updates consume four 16-sample batches for three epochs."""
     model = factory()
     x = torch.arange(1.0, 65.0).reshape(-1, 1)
     y = 3.0 * x
     seen_batch_sizes = []
+    seen_first_targets = []
 
     def recording_loss(prediction, target):
         seen_batch_sizes.append(len(target))
+        seen_first_targets.append(float(target[0]))
         return nn.functional.mse_loss(prediction, target)
 
     scorer = AdaptationCompatibilityScorer(
@@ -69,9 +71,32 @@ def test_adaptation_scorer_matches_minibatch_update_structure():
 
     scorer._adapt(model, x, y)
 
-    # Twelve optimizer updates use 12 minibatches of 16. The final loss
-    # inspection is over the complete adaptation set and is not an update.
+    # Twelve optimizer updates use 12 minibatches of 16. The batches advance
+    # through all four minibatches and then wrap for the second and third
+    # epochs; the scorer must never silently repeat one 16-sample batch.
     assert seen_batch_sizes == [16] * 12 + [64]
+    assert seen_first_targets == [3.0, 51.0, 99.0, 147.0] * 3 + [3.0]
+
+
+def test_adaptation_scorer_rejects_invalid_batch_size():
+    scorer = AdaptationCompatibilityScorer(
+        model_factory=factory,
+        loss_fn=nn.functional.mse_loss,
+        probe_fn=lambda _: (torch.ones(2, 1), torch.ones(2, 1)),
+        batch_size=0,
+    )
+
+    with torch.no_grad():
+        record_model = factory()
+    memory = SkillMemory()
+    memory.register("skill", record_model.state_dict())
+
+    try:
+        scorer(memory.get("skill"), Experience())
+    except ValueError as exc:
+        assert "batch_size" in str(exc)
+    else:
+        raise AssertionError("expected invalid batch_size to raise ValueError")
 
 
 def test_automatic_policy_uses_adaptation_value_for_clone():
