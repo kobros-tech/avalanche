@@ -49,5 +49,6 @@ strategy = Naive(
 # strategy.train(benchmark.train_stream)
 # strategy.eval(benchmark.test_stream)
 #
-# The plugin will query the memory before each experience and register the
-# resulting model state afterward.
+# Before each training experience the plugin selects REUSE, CLONE, or SCRATCH.
+# REUSE activates an existing skill without registering a new one; CLONE and
+# SCRATCH train a new acquisition state and register it afterward.
